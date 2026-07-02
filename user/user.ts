@@ -199,7 +199,7 @@ export const create = api(
 
 		await UserCreatedTopic.publish({ user_id: id, email, name });
 
-		return { id, email, name, created_at: new Date().toISOString() };
+		return { id, email, name, role: 'user', created_at: new Date().toISOString() };
 	},
 );
 
@@ -285,7 +285,7 @@ export const register = api(
 
 		await UserCreatedTopic.publish({ user_id: id, email, name });
 
-		return { id, email, name, created_at: new Date().toISOString() };
+		return { id, email, name, role: 'user', created_at: new Date().toISOString() };
 	},
 );
 

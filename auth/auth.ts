@@ -37,15 +37,4 @@ export const auth = authHandler<AuthParams, AuthData>(
 
 export const gw = new Gateway({
 	authHandler: auth,
-	cors: {
-		allowOriginsWithCredentials: [
-			"https://erp.innovwayz.io",
-			// Allow local dev origins
-			"http://localhost:3000",
-			"http://localhost:3001",
-		],
-		allowOriginsWithoutCredentials: ["*"],
-		allowHeaders: ["Authorization", "Content-Type"],
-		exposeHeaders: ["Content-Type"],
-	},
 });
