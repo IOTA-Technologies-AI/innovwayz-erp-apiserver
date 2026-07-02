@@ -3,15 +3,36 @@ import { appMeta } from "encore.dev";
 import { Topic } from "encore.dev/pubsub";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
 import crypto from "node:crypto";
+import { promisify } from "node:util";
+
+const scrypt = promisify(crypto.scrypt);
+
+/** Hash a password with a given salt using scrypt. */
+async function hashPassword(password: string, salt: string): Promise<string> {
+	const buf = (await scrypt(password, salt, 64)) as Buffer;
+	return buf.toString("hex");
+}
+
+/** Validate a plain-text password against a stored "salt:hash" value. */
+async function verifyPassword(
+	password: string,
+	storedHash: string,
+): Promise<boolean> {
+	const [salt, hash] = storedHash.split(":");
+	if (!salt || !hash) return false;
+	const derived = await hashPassword(password, salt);
+	// Constant-time comparison
+	return crypto.timingSafeEqual(Buffer.from(derived), Buffer.from(hash));
+}
 
 // Landing page with setup instructions and API documentation.
 export const index = api.raw(
-  { expose: true, method: "GET", path: "/" },
-  async (req, resp) => {
-    const baseUrl = appMeta().apiBaseUrl;
-    resp.setHeader("Content-Type", "text/html");
-    resp.end(landingPage.replaceAll("{{baseUrl}}", baseUrl));
-  },
+	{ expose: true, method: "GET", path: "/" },
+	async (req, resp) => {
+		const baseUrl = appMeta().apiBaseUrl;
+		resp.setHeader("Content-Type", "text/html");
+		resp.end(landingPage.replaceAll("{{baseUrl}}", baseUrl));
+	},
 );
 
 const landingPage = `<!DOCTYPE html>
@@ -138,73 +159,204 @@ curl "{{baseUrl}}/projects?owner_id=&lt;user_id&gt;"</code></pre>
 </html>`;
 
 const db = new SQLDatabase("user", {
-  migrations: "./migrations",
+	migrations: "./migrations",
 });
 
 export interface UserCreatedEvent {
-  user_id: string;
-  email: string;
-  name: string;
+	user_id: string;
+	email: string;
+	name: string;
 }
 
 export const UserCreatedTopic = new Topic<UserCreatedEvent>("user-created", {
-  deliveryGuarantee: "at-least-once",
+	deliveryGuarantee: "at-least-once",
 });
 
 interface CreateUserRequest {
-  email: string;
-  name: string;
+	email: string;
+	name: string;
 }
 
 interface User {
-  id: string;
-  email: string;
-  name: string;
-  created_at: string;
+	id: string;
+	email: string;
+	name: string;
+	created_at: string;
 }
 
 // Create a new user. Publishes a UserCreated event for downstream services.
 export const create = api(
-  { expose: true, auth: false, method: "POST", path: "/users" },
-  async ({ email, name }: CreateUserRequest): Promise<User> => {
-    const id = crypto.randomUUID();
+	{ expose: true, auth: false, method: "POST", path: "/users" },
+	async ({ email, name }: CreateUserRequest): Promise<User> => {
+		const id = crypto.randomUUID();
 
-    await db.exec`
+		await db.exec`
       INSERT INTO users (id, email, name)
       VALUES (${id}, ${email}, ${name})
     `;
 
-    await UserCreatedTopic.publish({ user_id: id, email, name });
+		await UserCreatedTopic.publish({ user_id: id, email, name });
 
-    return { id, email, name, created_at: new Date().toISOString() };
-  },
+		return { id, email, name, created_at: new Date().toISOString() };
+	},
 );
 
 // Get a user by ID.
 export const get = api(
-  { expose: true, auth: false, method: "GET", path: "/users/:id" },
-  async ({ id }: { id: string }): Promise<User> => {
-    const row = await db.queryRow<User>`
+	{ expose: true, auth: false, method: "GET", path: "/users/:id" },
+	async ({ id }: { id: string }): Promise<User> => {
+		const row = await db.queryRow<User>`
       SELECT id, email, name, created_at
       FROM users WHERE id = ${id}
     `;
-    if (!row) throw APIError.notFound("user not found");
-    return row;
-  },
+		if (!row) throw APIError.notFound("user not found");
+		return row;
+	},
 );
 
 // List all users.
 export const list = api(
-  { expose: true, auth: false, method: "GET", path: "/users" },
-  async (): Promise<{ users: User[] }> => {
-    const rows = db.query<User>`
+	{ expose: true, auth: false, method: "GET", path: "/users" },
+	async (): Promise<{ users: User[] }> => {
+		const rows = db.query<User>`
       SELECT id, email, name, created_at
       FROM users ORDER BY created_at DESC
     `;
-    const users: User[] = [];
-    for await (const row of rows) {
-      users.push(row);
-    }
-    return { users };
-  },
+		const users: User[] = [];
+		for await (const row of rows) {
+			users.push(row);
+		}
+		return { users };
+	},
+);
+
+// ─── Auth endpoints ──────────────────────────────────────────────────────────
+
+interface RegisterRequest {
+	email: string;
+	name: string;
+	password: string;
+}
+
+interface LoginRequest {
+	email: string;
+	password: string;
+}
+
+export interface LoginResponse {
+	token: string;
+	user: User;
+}
+
+/**
+ * Register a new user with email + password.
+ * Publishes a UserCreated event for downstream services (billing, etc.).
+ */
+export const register = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/register" },
+	async ({ email, name, password }: RegisterRequest): Promise<User> => {
+		if (!email || !name || !password) {
+			throw APIError.invalidArgument("email, name and password are required");
+		}
+		if (password.length < 8) {
+			throw APIError.invalidArgument("password must be at least 8 characters");
+		}
+
+		const id = crypto.randomUUID();
+		const salt = crypto.randomBytes(16).toString("hex");
+		const hash = await hashPassword(password, salt);
+		const passwordHash = `${salt}:${hash}`;
+
+		try {
+			await db.exec`
+        INSERT INTO users (id, email, name, password_hash)
+        VALUES (${id}, ${email}, ${name}, ${passwordHash})
+      `;
+		} catch (err: unknown) {
+			const msg = String(err);
+			if (msg.includes("unique") || msg.includes("duplicate")) {
+				throw APIError.alreadyExists("email already registered");
+			}
+			throw err;
+		}
+
+		await UserCreatedTopic.publish({ user_id: id, email, name });
+
+		return { id, email, name, created_at: new Date().toISOString() };
+	},
+);
+
+/**
+ * Login with email + password. Returns a session token (7-day expiry).
+ */
+export const login = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/login" },
+	async ({ email, password }: LoginRequest): Promise<LoginResponse> => {
+		if (!email || !password) {
+			throw APIError.invalidArgument("email and password are required");
+		}
+
+		const row = await db.queryRow<User & { password_hash: string }>`
+      SELECT id, email, name, created_at, password_hash
+      FROM users WHERE email = ${email}
+    `;
+
+		// Use constant-time comparison to prevent timing attacks
+		const valid = row
+			? await verifyPassword(password, row.password_hash)
+			: false;
+
+		if (!row || !valid) {
+			throw APIError.unauthenticated("invalid email or password");
+		}
+
+		const token = crypto.randomBytes(32).toString("hex");
+		const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+		await db.exec`
+      INSERT INTO sessions (token, user_id, expires_at)
+      VALUES (${token}, ${row.id}, ${expiresAt.toISOString()})
+    `;
+
+		return {
+			token,
+			user: {
+				id: row.id,
+				email: row.email,
+				name: row.name,
+				created_at: row.created_at,
+			},
+		};
+	},
+);
+
+/** Internal endpoint used by the auth handler to validate session tokens. */
+export const validateToken = api(
+	{ expose: false, auth: false, method: "GET", path: "/auth/validate" },
+	async ({ token }: { token: string }): Promise<{ user_id: string }> => {
+		const row = await db.queryRow<{ user_id: string; expires_at: string }>`
+      SELECT user_id, expires_at
+      FROM sessions
+      WHERE token = ${token}
+    `;
+
+		if (!row) throw APIError.unauthenticated("invalid token");
+		if (new Date(row.expires_at) < new Date()) {
+			throw APIError.unauthenticated("token expired");
+		}
+
+		return { user_id: row.user_id };
+	},
+);
+
+/**
+ * Logout — invalidates the session token.
+ * Requires the token to be passed in the request body.
+ */
+export const logout = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/logout" },
+	async ({ token }: { token: string }): Promise<{ ok: boolean }> => {
+		await db.exec`DELETE FROM sessions WHERE token = ${token}`;
+		return { ok: true };
+	},
 );

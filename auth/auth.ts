@@ -1,31 +1,40 @@
-import { APIError, Gateway } from "encore.dev/api";
+import { APIError, Gateway, Header } from "encore.dev/api";
 import { authHandler } from "encore.dev/auth";
-import { Query } from "encore.dev/api";
+import { validateToken } from "../user/user";
 
-// AuthParams defines how the auth handler receives credentials.
+// AuthParams reads a Bearer token from the Authorization header.
 interface AuthParams {
-  // The user ID to authenticate as. Pass as ?auth_user=<user_id>.
-  auth_user: Query<string>;
+	authorization: Header<"Authorization">;
 }
 
-// AuthData represents the authenticated user's data.
+// AuthData is available to all downstream services via auth.data().
 interface AuthData {
-  userID: string;
+	userID: string;
 }
 
-// Placeholder auth handler for demo purposes.
-// Reads the user ID from the `auth_user` query string parameter.
-// In a real app, replace this with JWT validation, session cookies,
-// or an auth provider like Clerk or Auth0.
+/**
+ * Auth handler — validates a session token issued by /auth/login.
+ * Clients must send:  Authorization: Bearer <token>
+ */
 export const auth = authHandler<AuthParams, AuthData>(
-  async (params): Promise<AuthData> => {
-    if (!params.auth_user) {
-      throw APIError.unauthenticated("missing auth_user query parameter");
-    }
-    return { userID: params.auth_user };
-  },
+	async (params): Promise<AuthData> => {
+		const header = params.authorization ?? "";
+		if (!header.startsWith("Bearer ")) {
+			throw APIError.unauthenticated(
+				"missing or malformed Authorization header",
+			);
+		}
+
+		const token = header.slice("Bearer ".length).trim();
+		if (!token) {
+			throw APIError.unauthenticated("empty token");
+		}
+
+		const { user_id } = await validateToken({ token });
+		return { userID: user_id };
+	},
 );
 
 export const gw = new Gateway({
-  authHandler: auth,
+	authHandler: auth,
 });
