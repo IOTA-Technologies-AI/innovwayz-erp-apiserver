@@ -321,7 +321,7 @@ export const logout = api(
 
 const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
 const FROM_EMAIL =
-	process.env.RESEND_FROM_EMAIL ?? "InnovWayz ERP <noreply@innovwayz.com>";
+	process.env.RESEND_FROM_EMAIL ?? "InnovWayz ERP <noreply@emails.innovwayz.io>";
 const APP_URL = process.env.APP_URL ?? "https://erp.innovwayz.io";
 
 async function sendEmail(
