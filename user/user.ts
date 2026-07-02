@@ -286,50 +286,6 @@ export const register = api(
 	},
 );
 
-/**
- * Login with email + password. Returns a session token (7-day expiry).
- */
-export const login = api(
-	{ expose: true, auth: false, method: "POST", path: "/auth/login" },
-	async ({ email, password }: LoginRequest): Promise<LoginResponse> => {
-		if (!email || !password) {
-			throw APIError.invalidArgument("email and password are required");
-		}
-
-		const row = await db.queryRow<User & { password_hash: string }>`
-      SELECT id, email, name, created_at, password_hash
-      FROM users WHERE email = ${email}
-    `;
-
-		// Use constant-time comparison to prevent timing attacks
-		const valid = row
-			? await verifyPassword(password, row.password_hash)
-			: false;
-
-		if (!row || !valid) {
-			throw APIError.unauthenticated("invalid email or password");
-		}
-
-		const token = crypto.randomBytes(32).toString("hex");
-		const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
-
-		await db.exec`
-      INSERT INTO sessions (token, user_id, expires_at)
-      VALUES (${token}, ${row.id}, ${expiresAt.toISOString()})
-    `;
-
-		return {
-			token,
-			user: {
-				id: row.id,
-				email: row.email,
-				name: row.name,
-				created_at: row.created_at,
-			},
-		};
-	},
-);
-
 /** Internal endpoint used by the auth handler to validate session tokens. */
 export const validateToken = api(
 	{ expose: false, auth: false, method: "GET", path: "/auth/validate" },
