@@ -459,8 +459,8 @@ export const invite = api(
           <td style="background:#0f172a;border-radius:12px 12px 0 0;padding:28px 40px;text-align:center;">
             <img src="https://innovwayz.com/images/logo/symbol.avif"
                  alt="InnovWayz"
-                 width="44" height="44"
-                 style="display:inline-block;vertical-align:middle;margin-right:14px;border:0;" />
+                 height="44"
+                 style="display:inline-block;vertical-align:middle;margin-right:14px;border:0;width:auto;" />
             <span style="color:#ffffff;font-size:22px;font-weight:700;vertical-align:middle;letter-spacing:-0.3px;">InnovWayz ERP</span>
           </td>
         </tr>
@@ -629,8 +629,8 @@ export const loginWithOtp = api(
           <td style="background:#0f172a;border-radius:12px 12px 0 0;padding:28px 40px;text-align:center;">
             <img src="https://innovwayz.com/images/logo/symbol.avif"
                  alt="InnovWayz"
-                 width="44" height="44"
-                 style="display:inline-block;vertical-align:middle;margin-right:14px;border:0;" />
+                 height="44"
+                 style="display:inline-block;vertical-align:middle;margin-right:14px;border:0;width:auto;" />
             <span style="color:#ffffff;font-size:22px;font-weight:700;vertical-align:middle;letter-spacing:-0.3px;">InnovWayz ERP</span>
           </td>
         </tr>
