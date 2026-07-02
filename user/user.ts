@@ -1,5 +1,6 @@
 import { api, APIError } from "encore.dev/api";
 import { appMeta } from "encore.dev";
+import { secret } from "encore.dev/config";
 import { Topic } from "encore.dev/pubsub";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
 import crypto from "node:crypto";
@@ -258,13 +259,14 @@ export const register = api(
 		if (!email || !name || !password) {
 			throw APIError.invalidArgument("email, name and password are required");
 		}
-		if (password.length < 8) {
+		const plainPassword = await decryptPassword(password);
+		if (plainPassword.length < 8) {
 			throw APIError.invalidArgument("password must be at least 8 characters");
 		}
 
 		const id = crypto.randomUUID();
 		const salt = crypto.randomBytes(16).toString("hex");
-		const hash = await hashPassword(password, salt);
+		const hash = await hashPassword(plainPassword, salt);
 		const passwordHash = `${salt}:${hash}`;
 
 		try {
@@ -283,6 +285,27 @@ export const register = api(
 		await UserCreatedTopic.publish({ user_id: id, email, name });
 
 		return { id, email, name, created_at: new Date().toISOString() };
+	},
+);
+
+/**
+ * Returns the RSA public key in PEM format so the frontend can encrypt
+ * credentials before sending them over the wire.
+ */
+export const getPublicKey = api(
+	{ expose: true, auth: false, method: "GET", path: "/auth/public-key" },
+	async (): Promise<{ publicKey: string }> => {
+		let pem: string;
+		try {
+			pem = rsaPrivateKeySecret();
+		} catch {
+			throw APIError.notFound("RSA key not configured");
+		}
+		const privateKey = crypto.createPrivateKey(pem);
+		const pub = crypto.createPublicKey(privateKey);
+		return {
+			publicKey: pub.export({ type: "spki", format: "pem" }) as string,
+		};
 	},
 );
 
@@ -317,25 +340,62 @@ export const logout = api(
 	},
 );
 
-// ─── Resend email helper ──────────────────────────────────────────────────────
+// ─── Encore secrets ──────────────────────────────────────────────────────────
 
-const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
-const FROM_EMAIL =
-	process.env.RESEND_FROM_EMAIL ?? "InnovWayz ERP <noreply@emails.innovwayz.io>";
-const APP_URL = process.env.APP_URL ?? "https://erp.innovwayz.io";
+const resendApiKey = secret("RESEND_API_KEY");
+const resendFromEmail = secret("RESEND_FROM_EMAIL");
+const appUrl = secret("APP_URL");
+const rsaPrivateKeySecret = secret("RSA_PRIVATE_KEY");
+
+// ─── RSA credential decryption ────────────────────────────────────────────────
+
+/**
+ * Decrypt a base64-encoded RSA-OAEP-SHA256 ciphertext sent by the frontend.
+ * Falls back to treating the value as plaintext when RSA_PRIVATE_KEY is not
+ * configured (local development without secrets).
+ */
+async function decryptPassword(value: string): Promise<string> {
+	let pem: string;
+	try {
+		pem = rsaPrivateKeySecret();
+	} catch {
+		// Secret not configured — treat value as plaintext (dev only)
+		return value;
+	}
+	try {
+		const privateKey = crypto.createPrivateKey(pem);
+		const buffer = Buffer.from(value, "base64");
+		const decrypted = crypto.privateDecrypt(
+			{
+				key: privateKey,
+				padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+				oaepHash: "sha256",
+			},
+			buffer,
+		);
+		return decrypted.toString("utf8");
+	} catch {
+		// Decryption failed — might be plaintext from a dev environment
+		return value;
+	}
+}
+
+// ─── Resend email helper ──────────────────────────────────────────────────────
 
 async function sendEmail(
 	to: string,
 	subject: string,
 	html: string,
 ): Promise<void> {
+	const fromEmail =
+		resendFromEmail() || "InnovWayz ERP <noreply@emails.innovwayz.io>";
 	const res = await fetch("https://api.resend.com/emails", {
 		method: "POST",
 		headers: {
-			Authorization: `Bearer ${RESEND_API_KEY}`,
+			Authorization: `Bearer ${resendApiKey()}`,
 			"Content-Type": "application/json",
 		},
-		body: JSON.stringify({ from: FROM_EMAIL, to, subject, html }),
+		body: JSON.stringify({ from: fromEmail, to, subject, html }),
 	});
 	if (!res.ok) {
 		const body = await res.text();
@@ -381,7 +441,8 @@ export const invite = api(
       VALUES (${token}, ${email}, ${name}, ${expiresAt.toISOString()})
     `;
 
-		const inviteLink = `${APP_URL}/auth/accept-invite?token=${token}`;
+		const baseUrl = appUrl() || "https://erp.innovwayz.io";
+		const inviteLink = `${baseUrl}/auth/accept-invite?token=${token}`;
 		await sendEmail(
 			email,
 			"You're invited to InnovWayz ERP",
@@ -418,7 +479,8 @@ export const acceptInvite = api(
 	async ({ token, password }: AcceptInviteRequest): Promise<LoginResponse> => {
 		if (!token || !password)
 			throw APIError.invalidArgument("token and password are required");
-		if (password.length < 8)
+		const plainPassword = await decryptPassword(password);
+		if (plainPassword.length < 8)
 			throw APIError.invalidArgument("password must be at least 8 characters");
 
 		const inv = await db.queryRow<{
@@ -437,7 +499,7 @@ export const acceptInvite = api(
 			throw APIError.failedPrecondition("invitation has expired");
 
 		const salt = crypto.randomBytes(16).toString("hex");
-		const hash = await hashPassword(password, salt);
+		const hash = await hashPassword(plainPassword, salt);
 		const passwordHash = `${salt}:${hash}`;
 
 		await db.exec`
@@ -482,6 +544,8 @@ export const loginWithOtp = api(
 		if (!email || !password)
 			throw APIError.invalidArgument("email and password are required");
 
+		const plainPassword = await decryptPassword(password);
+
 		const row = await db.queryRow<
 			User & { password_hash: string; is_active: boolean }
 		>`
@@ -490,7 +554,7 @@ export const loginWithOtp = api(
     `;
 
 		const valid = row
-			? await verifyPassword(password, row.password_hash)
+			? await verifyPassword(plainPassword, row.password_hash)
 			: false;
 
 		if (!row || !valid)
