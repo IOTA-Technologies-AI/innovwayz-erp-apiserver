@@ -360,3 +360,298 @@ export const logout = api(
 		return { ok: true };
 	},
 );
+
+// ─── Resend email helper ──────────────────────────────────────────────────────
+
+const RESEND_API_KEY = process.env.RESEND_API_KEY ?? "";
+const FROM_EMAIL =
+	process.env.RESEND_FROM_EMAIL ?? "InnovWayz ERP <noreply@innovwayz.com>";
+const APP_URL = process.env.APP_URL ?? "https://erp.innovwayz.io";
+
+async function sendEmail(
+	to: string,
+	subject: string,
+	html: string,
+): Promise<void> {
+	const res = await fetch("https://api.resend.com/emails", {
+		method: "POST",
+		headers: {
+			Authorization: `Bearer ${RESEND_API_KEY}`,
+			"Content-Type": "application/json",
+		},
+		body: JSON.stringify({ from: FROM_EMAIL, to, subject, html }),
+	});
+	if (!res.ok) {
+		const body = await res.text();
+		throw new Error(`Resend error ${res.status}: ${body}`);
+	}
+}
+
+// ─── Invite-only registration ─────────────────────────────────────────────────
+
+interface InviteRequest {
+	email: string;
+	name: string;
+}
+
+/**
+ * Invite a new user. Creates an inactive user record and sends an invite email.
+ * Requires the caller to be authenticated.
+ */
+export const invite = api(
+	{ expose: true, auth: true, method: "POST", path: "/auth/invite" },
+	async ({ email, name }: InviteRequest): Promise<{ ok: boolean }> => {
+		if (!email || !name)
+			throw APIError.invalidArgument("email and name are required");
+
+		// Check if already registered
+		const existing = await db.queryRow<{ id: string }>`
+      SELECT id FROM users WHERE email = ${email}
+    `;
+		if (existing) throw APIError.alreadyExists("email already registered");
+
+		// Create inactive user
+		const userId = crypto.randomUUID();
+		await db.exec`
+      INSERT INTO users (id, email, name, is_active)
+      VALUES (${userId}, ${email}, ${name}, FALSE)
+    `;
+
+		// Create invitation token (valid 7 days)
+		const token = crypto.randomBytes(32).toString("hex");
+		const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+		await db.exec`
+      INSERT INTO invitations (token, email, name, expires_at)
+      VALUES (${token}, ${email}, ${name}, ${expiresAt.toISOString()})
+    `;
+
+		const inviteLink = `${APP_URL}/auth/accept-invite?token=${token}`;
+		await sendEmail(
+			email,
+			"You're invited to InnovWayz ERP",
+			`
+      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
+        <h2 style="color:#1a202c;">Welcome to InnovWayz ERP</h2>
+        <p style="color:#4a5568;">Hi ${name},</p>
+        <p style="color:#4a5568;">You've been invited to access the InnovWayz ERP platform. Click the button below to set your password and get started.</p>
+        <a href="${inviteLink}"
+           style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0;">
+          Accept Invitation
+        </a>
+        <p style="color:#718096;font-size:13px;">This link expires in 7 days. If you didn't expect this invitation, you can safely ignore this email.</p>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0;">
+        <p style="color:#a0aec0;font-size:12px;">InnovWayz Technologies &mdash; Developed by Jaffar</p>
+      </div>
+      `,
+		);
+
+		return { ok: true };
+	},
+);
+
+interface AcceptInviteRequest {
+	token: string;
+	password: string;
+}
+
+/**
+ * Accept an invitation and set a password.
+ */
+export const acceptInvite = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/accept-invite" },
+	async ({ token, password }: AcceptInviteRequest): Promise<LoginResponse> => {
+		if (!token || !password)
+			throw APIError.invalidArgument("token and password are required");
+		if (password.length < 8)
+			throw APIError.invalidArgument("password must be at least 8 characters");
+
+		const inv = await db.queryRow<{
+			email: string;
+			name: string;
+			expires_at: string;
+			accepted_at: string | null;
+		}>`
+      SELECT email, name, expires_at, accepted_at FROM invitations WHERE token = ${token}
+    `;
+
+		if (!inv) throw APIError.notFound("invitation not found or already used");
+		if (inv.accepted_at)
+			throw APIError.failedPrecondition("invitation already accepted");
+		if (new Date(inv.expires_at) < new Date())
+			throw APIError.failedPrecondition("invitation has expired");
+
+		const salt = crypto.randomBytes(16).toString("hex");
+		const hash = await hashPassword(password, salt);
+		const passwordHash = `${salt}:${hash}`;
+
+		await db.exec`
+      UPDATE users
+      SET password_hash = ${passwordHash}, is_active = TRUE
+      WHERE email = ${inv.email}
+    `;
+
+		await db.exec`
+      UPDATE invitations SET accepted_at = NOW() WHERE token = ${token}
+    `;
+
+		// Auto-login after accepting invite
+		const user = await db.queryRow<User>`
+      SELECT id, email, name, created_at FROM users WHERE email = ${inv.email}
+    `;
+		if (!user) throw APIError.internal("user record missing");
+
+		const sessionToken = crypto.randomBytes(32).toString("hex");
+		const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+		await db.exec`
+      INSERT INTO sessions (token, user_id, expires_at)
+      VALUES (${sessionToken}, ${user.id}, ${expiresAt.toISOString()})
+    `;
+
+		return { token: sessionToken, user };
+	},
+);
+
+// ─── Modified login: password check → OTP ────────────────────────────────────
+
+/**
+ * Step 1 of login: verify email + password, then send a 6-digit OTP.
+ * Returns {otp_required: true} on success.
+ */
+export const loginWithOtp = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/login" },
+	async ({
+		email,
+		password,
+	}: LoginRequest): Promise<{ otp_required: boolean; message: string }> => {
+		if (!email || !password)
+			throw APIError.invalidArgument("email and password are required");
+
+		const row = await db.queryRow<
+			User & { password_hash: string; is_active: boolean }
+		>`
+      SELECT id, email, name, created_at, password_hash, is_active
+      FROM users WHERE email = ${email}
+    `;
+
+		const valid = row
+			? await verifyPassword(password, row.password_hash)
+			: false;
+
+		if (!row || !valid)
+			throw APIError.unauthenticated("invalid email or password");
+		if (!row.is_active)
+			throw APIError.permissionDenied(
+				"account not activated — check your invitation email",
+			);
+
+		// Generate 6-digit OTP
+		const code = String(Math.floor(100000 + Math.random() * 900000));
+		const otpId = crypto.randomUUID();
+		const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+		// Invalidate previous OTPs for this email
+		await db.exec`
+      UPDATE otp_codes SET used_at = NOW()
+      WHERE email = ${email} AND used_at IS NULL
+    `;
+
+		await db.exec`
+      INSERT INTO otp_codes (id, email, code, expires_at)
+      VALUES (${otpId}, ${email}, ${code}, ${expiresAt.toISOString()})
+    `;
+
+		await sendEmail(
+			email,
+			"Your InnovWayz ERP verification code",
+			`
+      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
+        <h2 style="color:#1a202c;">Verification Code</h2>
+        <p style="color:#4a5568;">Hi ${row.name},</p>
+        <p style="color:#4a5568;">Enter this code in the app to complete sign in. It expires in <strong>10 minutes</strong>.</p>
+        <div style="text-align:center;margin:24px 0;">
+          <span style="font-size:36px;font-weight:700;letter-spacing:8px;color:#4f46e5;">${code}</span>
+        </div>
+        <p style="color:#718096;font-size:13px;">If you didn't try to sign in, you can ignore this email.</p>
+        <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0;">
+        <p style="color:#a0aec0;font-size:12px;">InnovWayz Technologies &mdash; Developed by Jaffar</p>
+      </div>
+      `,
+		);
+
+		return { otp_required: true, message: "OTP sent to your email" };
+	},
+);
+
+interface VerifyOtpRequest {
+	email: string;
+	code: string;
+}
+
+/**
+ * Step 2 of login: verify OTP, issue session token.
+ */
+export const verifyOtp = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/verify-otp" },
+	async ({ email, code }: VerifyOtpRequest): Promise<LoginResponse> => {
+		if (!email || !code)
+			throw APIError.invalidArgument("email and code are required");
+
+		const otp = await db.queryRow<{
+			id: string;
+			expires_at: string;
+			used_at: string | null;
+		}>`
+      SELECT id, expires_at, used_at
+      FROM otp_codes
+      WHERE email = ${email} AND code = ${code}
+      ORDER BY created_at DESC
+      LIMIT 1
+    `;
+
+		if (!otp || otp.used_at)
+			throw APIError.unauthenticated("invalid or expired code");
+		if (new Date(otp.expires_at) < new Date())
+			throw APIError.unauthenticated("code has expired");
+
+		// Mark OTP as used
+		await db.exec`UPDATE otp_codes SET used_at = NOW() WHERE id = ${otp.id}`;
+
+		const user = await db.queryRow<User>`
+      SELECT id, email, name, created_at FROM users WHERE email = ${email}
+    `;
+		if (!user) throw APIError.notFound("user not found");
+
+		const token = crypto.randomBytes(32).toString("hex");
+		const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+		await db.exec`
+      INSERT INTO sessions (token, user_id, expires_at)
+      VALUES (${token}, ${user.id}, ${expiresAt.toISOString()})
+    `;
+
+		return { token, user };
+	},
+);
+
+/**
+ * Get current user by session token.
+ */
+export const me = api(
+	{ expose: true, auth: false, method: "GET", path: "/auth/me" },
+	async ({ token }: { token: string }): Promise<User> => {
+		const session = await db.queryRow<{
+			user_id: string;
+			expires_at: string;
+		}>`
+      SELECT user_id, expires_at FROM sessions WHERE token = ${token}
+    `;
+		if (!session) throw APIError.unauthenticated("invalid token");
+		if (new Date(session.expires_at) < new Date())
+			throw APIError.unauthenticated("session expired");
+
+		const user = await db.queryRow<User>`
+      SELECT id, email, name, created_at FROM users WHERE id = ${session.user_id}
+    `;
+		if (!user) throw APIError.notFound("user not found");
+		return user;
+	},
+);
