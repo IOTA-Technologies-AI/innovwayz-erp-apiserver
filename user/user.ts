@@ -182,6 +182,7 @@ interface User {
 	id: string;
 	email: string;
 	name: string;
+	role: string;
 	created_at: string;
 }
 
@@ -207,7 +208,7 @@ export const get = api(
 	{ expose: true, auth: false, method: "GET", path: "/users/:id" },
 	async ({ id }: { id: string }): Promise<User> => {
 		const row = await db.queryRow<User>`
-      SELECT id, email, name, created_at
+      SELECT id, email, name, role, created_at
       FROM users WHERE id = ${id}
     `;
 		if (!row) throw APIError.notFound("user not found");
@@ -220,7 +221,7 @@ export const list = api(
 	{ expose: true, auth: false, method: "GET", path: "/users" },
 	async (): Promise<{ users: User[] }> => {
 		const rows = db.query<User>`
-      SELECT id, email, name, created_at
+      SELECT id, email, name, role, created_at
       FROM users ORDER BY created_at DESC
     `;
 		const users: User[] = [];
@@ -408,6 +409,7 @@ async function sendEmail(
 interface InviteRequest {
 	email: string;
 	name: string;
+	role?: "super_admin" | "admin" | "manager" | "user";
 }
 
 /**
@@ -416,9 +418,14 @@ interface InviteRequest {
  */
 export const invite = api(
 	{ expose: true, auth: true, method: "POST", path: "/auth/invite" },
-	async ({ email, name }: InviteRequest): Promise<{ ok: boolean }> => {
+	async ({ email, name, role = "user" }: InviteRequest): Promise<{ ok: boolean }> => {
 		if (!email || !name)
 			throw APIError.invalidArgument("email and name are required");
+
+		// Validate role
+		const validRoles = ["super_admin", "admin", "manager", "user"];
+		if (!validRoles.includes(role))
+			throw APIError.invalidArgument("invalid role");
 
 		// Check if already registered
 		const existing = await db.queryRow<{ id: string }>`
@@ -426,11 +433,11 @@ export const invite = api(
     `;
 		if (existing) throw APIError.alreadyExists("email already registered");
 
-		// Create inactive user
+		// Create inactive user with specified role
 		const userId = crypto.randomUUID();
 		await db.exec`
-      INSERT INTO users (id, email, name, is_active)
-      VALUES (${userId}, ${email}, ${name}, FALSE)
+      INSERT INTO users (id, email, name, role, is_active)
+      VALUES (${userId}, ${email}, ${name}, ${role}, FALSE)
     `;
 
 		// Create invitation token (valid 7 days)
@@ -547,7 +554,7 @@ export const acceptInvite = api(
 
 		// Auto-login after accepting invite
 		const user = await db.queryRow<User>`
-      SELECT id, email, name, created_at FROM users WHERE email = ${inv.email}
+      SELECT id, email, name, role, created_at FROM users WHERE email = ${inv.email}
     `;
 		if (!user) throw APIError.internal("user record missing");
 
@@ -582,7 +589,7 @@ export const loginWithOtp = api(
 		const row = await db.queryRow<
 			User & { password_hash: string; is_active: boolean }
 		>`
-      SELECT id, email, name, created_at, password_hash, is_active
+      SELECT id, email, name, role, created_at, password_hash, is_active
       FROM users WHERE email = ${email}
     `;
 
@@ -705,7 +712,7 @@ export const verifyOtp = api(
 		await db.exec`UPDATE otp_codes SET used_at = NOW() WHERE id = ${otp.id}`;
 
 		const user = await db.queryRow<User>`
-      SELECT id, email, name, created_at FROM users WHERE email = ${email}
+      SELECT id, email, name, role, created_at FROM users WHERE email = ${email}
     `;
 		if (!user) throw APIError.notFound("user not found");
 
@@ -737,7 +744,7 @@ export const me = api(
 			throw APIError.unauthenticated("session expired");
 
 		const user = await db.queryRow<User>`
-      SELECT id, email, name, created_at FROM users WHERE id = ${session.user_id}
+      SELECT id, email, name, role, created_at FROM users WHERE id = ${session.user_id}
     `;
 		if (!user) throw APIError.notFound("user not found");
 		return user;
