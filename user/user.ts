@@ -418,7 +418,11 @@ interface InviteRequest {
  */
 export const invite = api(
 	{ expose: true, auth: true, method: "POST", path: "/auth/invite" },
-	async ({ email, name, role = "user" }: InviteRequest): Promise<{ ok: boolean }> => {
+	async ({
+		email,
+		name,
+		role = "user",
+	}: InviteRequest): Promise<{ ok: boolean }> => {
 		if (!email || !name)
 			throw APIError.invalidArgument("email and name are required");
 
