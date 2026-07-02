@@ -446,20 +446,53 @@ export const invite = api(
 		await sendEmail(
 			email,
 			"You're invited to InnovWayz ERP",
-			`
-      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-        <h2 style="color:#1a202c;">Welcome to InnovWayz ERP</h2>
-        <p style="color:#4a5568;">Hi ${name},</p>
-        <p style="color:#4a5568;">You've been invited to access the InnovWayz ERP platform. Click the button below to set your password and get started.</p>
-        <a href="${inviteLink}"
-           style="display:inline-block;background:#4f46e5;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;font-weight:600;margin:16px 0;">
-          Accept Invitation
-        </a>
-        <p style="color:#718096;font-size:13px;">This link expires in 7 days. If you didn't expect this invitation, you can safely ignore this email.</p>
-        <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0;">
-        <p style="color:#a0aec0;font-size:12px;">InnovWayz Technologies &mdash; Developed by Jaffar</p>
-      </div>
-      `,
+			`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- Banner -->
+        <tr>
+          <td style="background:#0f172a;border-radius:12px 12px 0 0;padding:28px 40px;text-align:center;">
+            <img src="https://innovwayz.com/images/logo/symbol.avif"
+                 alt="InnovWayz"
+                 width="44" height="44"
+                 style="display:inline-block;vertical-align:middle;margin-right:14px;border:0;" />
+            <span style="color:#ffffff;font-size:22px;font-weight:700;vertical-align:middle;letter-spacing:-0.3px;">InnovWayz ERP</span>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="background:#ffffff;padding:40px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">
+            <h2 style="margin:0 0 16px;color:#0f172a;font-size:22px;font-weight:700;">You&rsquo;re Invited</h2>
+            <p style="margin:0 0 12px;color:#475569;font-size:15px;line-height:1.6;">Hi <strong>${name}</strong>,</p>
+            <p style="margin:0 0 24px;color:#475569;font-size:15px;line-height:1.6;">You&rsquo;ve been invited to access the <strong>InnovWayz ERP</strong> platform. Click the button below to set your password and get started.</p>
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr><td align="center" style="padding:8px 0 28px;">
+                <a href="${inviteLink}"
+                   style="display:inline-block;background:#4f46e5;color:#ffffff;padding:14px 32px;border-radius:8px;text-decoration:none;font-size:15px;font-weight:600;">Accept Invitation</a>
+              </td></tr>
+            </table>
+            <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.5;">This link expires in <strong>7 days</strong>. If you didn&rsquo;t expect this invitation, you can safely ignore this email.</p>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px;padding:20px 40px;text-align:center;">
+            <p style="margin:0;color:#94a3b8;font-size:12px;">&copy; ${new Date().getFullYear()} InnovWayz Technologies. All Rights Reserved.</p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`,
 		);
 
 		return { ok: true };
@@ -583,19 +616,54 @@ export const loginWithOtp = api(
 		await sendEmail(
 			email,
 			"Your InnovWayz ERP verification code",
-			`
-      <div style="font-family:-apple-system,sans-serif;max-width:480px;margin:0 auto;padding:32px;">
-        <h2 style="color:#1a202c;">Verification Code</h2>
-        <p style="color:#4a5568;">Hi ${row.name},</p>
-        <p style="color:#4a5568;">Enter this code in the app to complete sign in. It expires in <strong>10 minutes</strong>.</p>
-        <div style="text-align:center;margin:24px 0;">
-          <span style="font-size:36px;font-weight:700;letter-spacing:8px;color:#4f46e5;">${code}</span>
-        </div>
-        <p style="color:#718096;font-size:13px;">If you didn't try to sign in, you can ignore this email.</p>
-        <hr style="border:none;border-top:1px solid #e2e8f0;margin:24px 0;">
-        <p style="color:#a0aec0;font-size:12px;">InnovWayz Technologies &mdash; Developed by Jaffar</p>
-      </div>
-      `,
+			`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+
+        <!-- Banner -->
+        <tr>
+          <td style="background:#0f172a;border-radius:12px 12px 0 0;padding:28px 40px;text-align:center;">
+            <img src="https://innovwayz.com/images/logo/symbol.avif"
+                 alt="InnovWayz"
+                 width="44" height="44"
+                 style="display:inline-block;vertical-align:middle;margin-right:14px;border:0;" />
+            <span style="color:#ffffff;font-size:22px;font-weight:700;vertical-align:middle;letter-spacing:-0.3px;">InnovWayz ERP</span>
+          </td>
+        </tr>
+
+        <!-- Body -->
+        <tr>
+          <td style="background:#ffffff;padding:40px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">
+            <h2 style="margin:0 0 16px;color:#0f172a;font-size:22px;font-weight:700;">Verification Code</h2>
+            <p style="margin:0 0 12px;color:#475569;font-size:15px;line-height:1.6;">Hi <strong>${row.name}</strong>,</p>
+            <p style="margin:0 0 24px;color:#475569;font-size:15px;line-height:1.6;">Enter this code in the app to complete sign in. It expires in <strong>10 minutes</strong>.</p>
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr><td align="center" style="padding:8px 0 28px;">
+                <div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:20px 36px;">
+                  <span style="font-size:42px;font-weight:800;letter-spacing:12px;color:#4f46e5;font-variant-numeric:tabular-nums;">${code}</span>
+                </div>
+              </td></tr>
+            </table>
+            <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.5;">If you didn&rsquo;t try to sign in, you can safely ignore this email.</p>
+          </td>
+        </tr>
+
+        <!-- Footer -->
+        <tr>
+          <td style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px;padding:20px 40px;text-align:center;">
+            <p style="margin:0;color:#94a3b8;font-size:12px;">&copy; ${new Date().getFullYear()} InnovWayz Technologies. All Rights Reserved.</p>
+          </td>
+        </tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`,
 		);
 
 		return { otp_required: true, message: "OTP sent to your email" };
