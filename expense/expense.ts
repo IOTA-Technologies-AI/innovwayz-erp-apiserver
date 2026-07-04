@@ -12,6 +12,7 @@ const db = new SQLDatabase("expense", {
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type ExpenseStatus =
+	| "draft"
 	| "pending_manager"
 	| "pending_admin"
 	| "approved"
@@ -53,6 +54,11 @@ export interface Expense {
 	processed_at: string | null;
 	payment_reference: string | null;
 	paid_amount: number | null;
+	recurring_id: string | null;
+	period_month: number | null;
+	period_year: number | null;
+	posted_by: string | null;
+	posted_at: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -86,6 +92,7 @@ const EXPENSE_COLUMNS = `
   manager_approved_by, manager_approved_at, admin_approved_by, admin_approved_at,
   rejected_by, rejected_at, rejection_reason,
   processed_by, processed_at, payment_reference, paid_amount,
+  recurring_id, period_month, period_year, posted_by, posted_at,
   created_at, updated_at
 `;
 
@@ -272,6 +279,11 @@ interface CreateExpenseRequest {
 	vendor?: string;
 	payment_method?: string;
 	attachment_url?: string;
+	period_month?: number;
+	period_year?: number;
+	// When true the expense is saved as an editable draft instead of being
+	// submitted straight into the approval workflow.
+	as_draft?: boolean;
 }
 
 export const createExpense = api(
@@ -314,37 +326,45 @@ export const createExpense = api(
 
 		const id = crypto.randomUUID();
 		const reference = await nextReference();
+		const status = req.as_draft ? "draft" : "pending_manager";
 
 		await db.exec`
       INSERT INTO expenses (
         id, reference, category, expense_class, expense_type_code, expense_type_name,
         employee_id, employee_name, customer_id, customer_name,
         title, description, amount, currency, expense_date, vendor, payment_method, attachment_url,
-        status, created_by, created_by_name
+        status, created_by, created_by_name, period_month, period_year
       ) VALUES (
         ${id}, ${reference}, ${category}, ${expenseClass}, ${req.expense_type_code ?? null}, ${req.expense_type_name},
         ${req.employee_id ?? null}, ${req.employee_name ?? null}, ${req.customer_id ?? null}, ${req.customer_name ?? null},
         ${req.title}, ${req.description ?? null}, ${req.amount}, ${req.currency ?? "SAR"},
         ${req.expense_date ?? new Date().toISOString().slice(0, 10)}, ${req.vendor ?? null},
         ${req.payment_method ?? null}, ${req.attachment_url ?? null},
-        'pending_manager', ${userID}, ${creatorName}
+        ${status}, ${userID}, ${creatorName}, ${req.period_month ?? null}, ${req.period_year ?? null}
       )
     `;
 
-		await logEvent(id, "created", userID, creatorName);
+		await logEvent(
+			id,
+			req.as_draft ? "created_draft" : "created",
+			userID,
+			creatorName,
+		);
 
 		const created = await fetchExpense(id);
 
-		// Notify managers & admins of a new expense awaiting approval.
-		void notifyRoles(
-			["manager", "admin", "super_admin"],
-			`New expense pending approval — ${created.reference}`,
-			emailShell(
-				"New Expense Awaiting Approval",
-				expenseRows(created),
-				"Please review this expense in the InnovWayz ERP portal.",
-			),
-		);
+		// Notify managers & admins only once the expense is actually submitted.
+		if (!req.as_draft) {
+			void notifyRoles(
+				["manager", "admin", "super_admin"],
+				`New expense pending approval — ${created.reference}`,
+				emailShell(
+					"New Expense Awaiting Approval",
+					expenseRows(created),
+					"Please review this expense in the InnovWayz ERP portal.",
+				),
+			);
+		}
 
 		return created;
 	},
@@ -515,10 +535,11 @@ export const updateExpense = api(
 		const { userID, role } = getAuthData()!;
 		const current = await fetchExpense(id);
 
-		// Creator may edit only while still pending initial (manager) approval.
-		// Admins/super_admins may edit until it is processed/paid.
+		// Creator may edit while the record is a draft or still pending initial
+		// (manager) approval. Admins/super_admins may edit until processed/paid.
 		const creatorEditable =
-			current.created_by === userID && current.status === "pending_manager";
+			current.created_by === userID &&
+			["draft", "pending_manager"].includes(current.status);
 		const adminEditable =
 			isAdmin(role) && !["paid", "cancelled"].includes(current.status);
 		if (!creatorEditable && !adminEditable)
@@ -567,19 +588,77 @@ export const deleteExpense = api(
 	},
 );
 
-// ─── Approvals ────────────────────────────────────────────────────────────────
+// ─── Post (submit a draft for approval) ───────────────────────────────────────
 
-export const approveExpense = api(
-	{ expose: true, auth: true, method: "POST", path: "/expenses/:id/approve" },
+export const postExpense = api(
+	{ expose: true, auth: true, method: "POST", path: "/expenses/:id/post" },
 	async ({ id }: { id: string }): Promise<Expense> => {
 		const { userID, role } = getAuthData()!;
 		const e = await fetchExpense(id);
+		if (e.status !== "draft")
+			throw APIError.failedPrecondition("only draft expenses can be posted");
+		if (e.created_by !== userID && !isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied("not allowed to post this expense");
 
 		let actorName: string | null = null;
 		try {
 			actorName = (await user.getContact({ id: userID })).name;
 		} catch {
 			actorName = null;
+		}
+
+		await db.exec`
+      UPDATE expenses SET
+        status = 'pending_manager', posted_by = ${userID}, posted_at = NOW(), updated_at = NOW()
+      WHERE id = ${id}
+    `;
+		await logEvent(id, "submitted", userID, actorName);
+		const updated = await fetchExpense(id);
+		void notifyRoles(
+			["manager", "admin", "super_admin"],
+			`Expense submitted for approval — ${updated.reference}`,
+			emailShell(
+				"Expense Submitted for Approval",
+				expenseRows(updated),
+				"Please review this expense in the InnovWayz ERP portal.",
+			),
+		);
+		return updated;
+	},
+);
+
+// ─── Approvals ────────────────────────────────────────────────────────────────
+
+export const approveExpense = api(
+	{ expose: true, auth: true, method: "POST", path: "/expenses/:id/approve" },
+	async ({ id, amount }: { id: string; amount?: number }): Promise<Expense> => {
+		const { userID, role } = getAuthData()!;
+		let e = await fetchExpense(id);
+
+		let actorName: string | null = null;
+		try {
+			actorName = (await user.getContact({ id: userID })).name;
+		} catch {
+			actorName = null;
+		}
+
+		// Approver may amend the amount (up or down) before signing off.
+		if (
+			amount !== undefined &&
+			amount !== null &&
+			Number(amount) !== Number(e.amount)
+		) {
+			if (amount < 0) throw APIError.invalidArgument("amount must be positive");
+			const prev = Number(e.amount);
+			await db.exec`UPDATE expenses SET amount = ${amount}, updated_at = NOW() WHERE id = ${id}`;
+			await logEvent(
+				id,
+				"amount_amended",
+				userID,
+				actorName,
+				`${SAR(prev)} → ${SAR(Number(amount))}`,
+			);
+			e = await fetchExpense(id);
 		}
 
 		if (e.status === "pending_manager") {
@@ -840,5 +919,264 @@ export const expenseStats = api(
       FROM expenses
     `;
 		return row!;
+	},
+);
+
+// ─── Recurring templates (standard monthly expenses) ──────────────────────────
+
+interface RecurringExpense {
+	id: string;
+	title: string;
+	category: string;
+	expense_class: string;
+	expense_type_code: string | null;
+	expense_type_name: string;
+	employee_id: string | null;
+	employee_name: string | null;
+	customer_id: string | null;
+	customer_name: string | null;
+	description: string | null;
+	amount: number;
+	currency: string;
+	vendor: string | null;
+	payment_method: string | null;
+	day_of_month: number;
+	active: boolean;
+	created_by: string;
+	created_by_name: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+const RECURRING_COLUMNS = `
+  id, title, category, expense_class, expense_type_code, expense_type_name,
+  employee_id, employee_name, customer_id, customer_name, description,
+  amount, currency, vendor, payment_method, day_of_month, active,
+  created_by, created_by_name, created_at, updated_at
+`;
+
+async function fetchRecurring(id: string): Promise<RecurringExpense> {
+	const row = await db.rawQueryRow<RecurringExpense>(
+		`SELECT ${RECURRING_COLUMNS} FROM recurring_expenses WHERE id = $1`,
+		id,
+	);
+	if (!row) throw APIError.notFound("recurring template not found");
+	return row;
+}
+
+export const listRecurringExpenses = api(
+	{ expose: true, auth: true, method: "GET", path: "/recurring-expenses" },
+	async (): Promise<{ items: RecurringExpense[] }> => {
+		const { role } = getAuthData()!;
+		if (!isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied(
+				"not allowed to view recurring templates",
+			);
+		const rows = db.rawQuery<RecurringExpense>(
+			`SELECT ${RECURRING_COLUMNS} FROM recurring_expenses ORDER BY active DESC, title ASC`,
+		);
+		const items: RecurringExpense[] = [];
+		for await (const row of rows) items.push(row);
+		return { items };
+	},
+);
+
+interface CreateRecurringRequest {
+	title: string;
+	category?: string;
+	expense_class?: string;
+	expense_type_code?: string;
+	expense_type_name: string;
+	employee_id?: string;
+	employee_name?: string;
+	customer_id?: string;
+	customer_name?: string;
+	description?: string;
+	amount: number;
+	currency?: string;
+	vendor?: string;
+	payment_method?: string;
+	day_of_month?: number;
+	active?: boolean;
+}
+
+export const createRecurringExpense = api(
+	{ expose: true, auth: true, method: "POST", path: "/recurring-expenses" },
+	async (req: CreateRecurringRequest): Promise<RecurringExpense> => {
+		const { userID, role } = getAuthData()!;
+		if (!isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied(
+				"not allowed to manage recurring templates",
+			);
+		if (!req.title || !req.expense_type_name)
+			throw APIError.invalidArgument(
+				"title and expense_type_name are required",
+			);
+
+		let creatorName: string | null = null;
+		try {
+			creatorName = (await user.getContact({ id: userID })).name;
+		} catch {
+			creatorName = null;
+		}
+
+		const id = crypto.randomUUID();
+		await db.exec`
+      INSERT INTO recurring_expenses (
+        id, title, category, expense_class, expense_type_code, expense_type_name,
+        employee_id, employee_name, customer_id, customer_name, description,
+        amount, currency, vendor, payment_method, day_of_month, active,
+        created_by, created_by_name
+      ) VALUES (
+        ${id}, ${req.title}, ${req.category ?? "company"}, ${req.expense_class ?? "operational"},
+        ${req.expense_type_code ?? null}, ${req.expense_type_name},
+        ${req.employee_id ?? null}, ${req.employee_name ?? null},
+        ${req.customer_id ?? null}, ${req.customer_name ?? null}, ${req.description ?? null},
+        ${req.amount}, ${req.currency ?? "SAR"}, ${req.vendor ?? null}, ${req.payment_method ?? null},
+        ${req.day_of_month ?? 1}, ${req.active ?? true}, ${userID}, ${creatorName}
+      )
+    `;
+		return fetchRecurring(id);
+	},
+);
+
+interface UpdateRecurringRequest extends Partial<CreateRecurringRequest> {
+	id: string;
+}
+
+export const updateRecurringExpense = api(
+	{ expose: true, auth: true, method: "PUT", path: "/recurring-expenses/:id" },
+	async ({ id, ...req }: UpdateRecurringRequest): Promise<RecurringExpense> => {
+		const { role } = getAuthData()!;
+		if (!isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied(
+				"not allowed to manage recurring templates",
+			);
+		const current = await fetchRecurring(id);
+		await db.exec`
+      UPDATE recurring_expenses SET
+        title             = COALESCE(${req.title ?? null}, title),
+        category          = COALESCE(${req.category ?? null}, category),
+        expense_class     = COALESCE(${req.expense_class ?? null}, expense_class),
+        expense_type_code = ${req.expense_type_code !== undefined ? req.expense_type_code : current.expense_type_code},
+        expense_type_name = COALESCE(${req.expense_type_name ?? null}, expense_type_name),
+        employee_id       = ${req.employee_id !== undefined ? req.employee_id : current.employee_id},
+        employee_name     = ${req.employee_name !== undefined ? req.employee_name : current.employee_name},
+        customer_id       = ${req.customer_id !== undefined ? req.customer_id : current.customer_id},
+        customer_name     = ${req.customer_name !== undefined ? req.customer_name : current.customer_name},
+        description       = ${req.description !== undefined ? req.description : current.description},
+        amount            = COALESCE(${req.amount ?? null}, amount),
+        currency          = COALESCE(${req.currency ?? null}, currency),
+        vendor            = ${req.vendor !== undefined ? req.vendor : current.vendor},
+        payment_method    = ${req.payment_method !== undefined ? req.payment_method : current.payment_method},
+        day_of_month      = COALESCE(${req.day_of_month ?? null}, day_of_month),
+        active            = COALESCE(${req.active ?? null}, active),
+        updated_at        = NOW()
+      WHERE id = ${id}
+    `;
+		return fetchRecurring(id);
+	},
+);
+
+export const deleteRecurringExpense = api(
+	{
+		expose: true,
+		auth: true,
+		method: "DELETE",
+		path: "/recurring-expenses/:id",
+	},
+	async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied(
+				"not allowed to manage recurring templates",
+			);
+		await fetchRecurring(id);
+		await db.exec`DELETE FROM recurring_expenses WHERE id = ${id}`;
+		return { ok: true };
+	},
+);
+
+// ─── Generate monthly draft expenses from recurring templates ─────────────────
+
+interface GenerateExpensesRequest {
+	period_month: number; // 1-12
+	period_year: number;
+}
+
+interface GenerateExpensesResponse {
+	created: number;
+	skipped: number;
+}
+
+export const generateMonthlyExpenses = api(
+	{ expose: true, auth: true, method: "POST", path: "/expenses/generate" },
+	async (req: GenerateExpensesRequest): Promise<GenerateExpensesResponse> => {
+		const { userID, role } = getAuthData()!;
+		if (!isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied("not allowed to generate expenses");
+		if (req.period_month < 1 || req.period_month > 12)
+			throw APIError.invalidArgument("period_month must be between 1 and 12");
+
+		let creatorName: string | null = null;
+		try {
+			creatorName = (await user.getContact({ id: userID })).name;
+		} catch {
+			creatorName = null;
+		}
+
+		const templates: RecurringExpense[] = [];
+		const rows = db.rawQuery<RecurringExpense>(
+			`SELECT ${RECURRING_COLUMNS} FROM recurring_expenses WHERE active = TRUE`,
+		);
+		for await (const row of rows) templates.push(row);
+
+		let created = 0;
+		let skipped = 0;
+		const lastDay = new Date(req.period_year, req.period_month, 0).getDate();
+
+		for (const t of templates) {
+			const existing = await db.queryRow<{ id: string }>`
+        SELECT id FROM expenses
+        WHERE recurring_id = ${t.id}
+          AND period_month = ${req.period_month}
+          AND period_year = ${req.period_year}
+          AND status <> 'cancelled'
+        LIMIT 1
+      `;
+			if (existing) {
+				skipped++;
+				continue;
+			}
+
+			const day = Math.min(Math.max(t.day_of_month || 1, 1), lastDay);
+			const expenseDate = `${req.period_year}-${String(req.period_month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+			const id = crypto.randomUUID();
+			const reference = await nextReference();
+
+			await db.exec`
+        INSERT INTO expenses (
+          id, reference, category, expense_class, expense_type_code, expense_type_name,
+          employee_id, employee_name, customer_id, customer_name,
+          title, description, amount, currency, expense_date, vendor, payment_method,
+          status, created_by, created_by_name, recurring_id, period_month, period_year
+        ) VALUES (
+          ${id}, ${reference}, ${t.category}, ${t.expense_class}, ${t.expense_type_code}, ${t.expense_type_name},
+          ${t.employee_id}, ${t.employee_name}, ${t.customer_id}, ${t.customer_name},
+          ${t.title}, ${t.description}, ${t.amount}, ${t.currency}, ${expenseDate}, ${t.vendor}, ${t.payment_method},
+          'draft', ${userID}, ${creatorName}, ${t.id}, ${req.period_month}, ${req.period_year}
+        )
+      `;
+			await logEvent(
+				id,
+				"generated",
+				userID,
+				creatorName,
+				`From template: ${t.title}`,
+			);
+			created++;
+		}
+
+		return { created, skipped };
 	},
 );

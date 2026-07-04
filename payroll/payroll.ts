@@ -12,6 +12,7 @@ const db = new SQLDatabase("payroll", {
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 type SalaryStatus =
+	| "draft"
 	| "pending_manager"
 	| "pending_admin"
 	| "approved"
@@ -52,6 +53,8 @@ export interface SalaryPayment {
 	payment_reference: string | null;
 	paid_amount: number | null;
 	paid_at: string | null;
+	posted_by: string | null;
+	posted_at: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -76,6 +79,7 @@ const SALARY_COLUMNS = `
   manager_approved_by, manager_approved_at, admin_approved_by, admin_approved_at,
   rejected_by, rejected_at, rejection_reason,
   processed_by, processed_at, payment_reference, paid_amount, paid_at,
+  posted_by, posted_at,
   created_at, updated_at
 `;
 
@@ -357,7 +361,7 @@ export const generateMonthlyPayroll = api(
           period_month, period_year, base_amount, additions, deductions, net_amount,
           currency, status, created_by, created_by_name
         ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, 'SAR', 'pending_manager', $12, $13
+          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, 'SAR', 'draft', $12, $13
         )
         ON CONFLICT (employee_id, period_month, period_year) DO NOTHING
         RETURNING id`,
@@ -378,7 +382,7 @@ export const generateMonthlyPayroll = api(
 			if (res) {
 				created++;
 				totalNet += net;
-				await logEvent(id, "created", userID, creatorName);
+				await logEvent(id, "generated", userID, creatorName);
 			} else {
 				skipped++;
 			}
@@ -392,8 +396,8 @@ export const generateMonthlyPayroll = api(
 					"Monthly Payroll Generated",
 					`<tr><td style="padding:6px 0;color:#94a3b8;width:170px;">Period</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${monthLabel(req.period_month, req.period_year)}</td></tr>
            <tr><td style="padding:6px 0;color:#94a3b8;">Salaries created</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${created}</td></tr>
-           <tr><td style="padding:6px 0;color:#94a3b8;">Total net</td><td style="padding:6px 0;color:#0f172a;font-weight:700;">${SAR(totalNet)}</td></tr>`,
-					"These salary payments are awaiting manager approval.",
+					<tr><td style="padding:6px 0;color:#94a3b8;">Total net</td><td style="padding:6px 0;color:#0f172a;font-weight:700;">${SAR(totalNet)}</td></tr>`,
+					"These salary payments are drafts — review and post them to start the approval workflow.",
 				),
 			);
 		}
@@ -482,10 +486,11 @@ export const updateSalaryPayment = api(
 		const current = await fetchSalary(id);
 
 		const creatorEditable =
-			current.created_by === userID && current.status === "pending_manager";
+			current.created_by === userID &&
+			["draft", "pending_manager"].includes(current.status);
 		const managerEditable =
 			isManager(role) &&
-			["pending_manager", "pending_admin"].includes(current.status);
+			["draft", "pending_manager", "pending_admin"].includes(current.status);
 		if (!creatorEditable && !managerEditable)
 			throw APIError.permissionDenied(
 				"not allowed to edit this salary payment",
@@ -531,14 +536,90 @@ export const deleteSalaryPayment = api(
 	},
 );
 
+// ─── Post (submit a draft for approval) ───────────────────────────────────────
+
+export const postSalaryPayment = api(
+	{ expose: true, auth: true, method: "POST", path: "/payroll/:id/post" },
+	async ({ id }: { id: string }): Promise<SalaryPayment> => {
+		const { userID, role } = getAuthData()!;
+		const s = await fetchSalary(id);
+		if (s.status !== "draft")
+			throw APIError.failedPrecondition("only draft salaries can be posted");
+		if (s.created_by !== userID && !isManager(role) && !isFinance(role))
+			throw APIError.permissionDenied(
+				"not allowed to post this salary payment",
+			);
+
+		const actorName = await actorNameOf(userID);
+		await db.exec`
+      UPDATE salary_payments SET
+        status = 'pending_manager', posted_by = ${userID}, posted_at = NOW(), updated_at = NOW()
+      WHERE id = ${id}
+    `;
+		await logEvent(id, "submitted", userID, actorName);
+		const updated = await fetchSalary(id);
+		void notifyRoles(
+			["manager", "admin", "super_admin"],
+			`Salary submitted for approval — ${updated.reference}`,
+			emailShell(
+				"Salary Submitted for Approval",
+				salaryRows(updated),
+				"Please review this salary payment in the InnovWayz ERP portal.",
+			),
+		);
+		return updated;
+	},
+);
+
 // ─── Approvals ────────────────────────────────────────────────────────────────
 
 export const approveSalaryPayment = api(
 	{ expose: true, auth: true, method: "POST", path: "/payroll/:id/approve" },
-	async ({ id }: { id: string }): Promise<SalaryPayment> => {
+	async ({
+		id,
+		base_amount,
+		additions,
+		deductions,
+	}: {
+		id: string;
+		base_amount?: number;
+		additions?: number;
+		deductions?: number;
+	}): Promise<SalaryPayment> => {
 		const { userID, role } = getAuthData()!;
-		const s = await fetchSalary(id);
+		let s = await fetchSalary(id);
 		const actorName = await actorNameOf(userID);
+
+		// Approver may amend the figures (up or down) before signing off.
+		if (
+			base_amount !== undefined ||
+			additions !== undefined ||
+			deductions !== undefined
+		) {
+			const base = base_amount ?? Number(s.base_amount);
+			const add = additions ?? Number(s.additions);
+			const ded = deductions ?? Number(s.deductions);
+			if (base < 0 || add < 0 || ded < 0)
+				throw APIError.invalidArgument("amounts must be positive");
+			const net = computeNet(base, add, ded);
+			if (net !== Number(s.net_amount)) {
+				const prev = Number(s.net_amount);
+				await db.exec`
+          UPDATE salary_payments SET
+            base_amount = ${base}, additions = ${add}, deductions = ${ded},
+            net_amount = ${net}, updated_at = NOW()
+          WHERE id = ${id}
+        `;
+				await logEvent(
+					id,
+					"amount_amended",
+					userID,
+					actorName,
+					`${SAR(prev)} → ${SAR(net)}`,
+				);
+				s = await fetchSalary(id);
+			}
+		}
 
 		if (s.status === "pending_manager") {
 			if (!isManager(role))
