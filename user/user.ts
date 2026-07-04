@@ -3,6 +3,7 @@ import { appMeta } from "encore.dev";
 import { secret } from "encore.dev/config";
 import { Topic } from "encore.dev/pubsub";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
+import log from "encore.dev/log";
 import crypto from "node:crypto";
 import { promisify } from "node:util";
 
@@ -325,11 +326,20 @@ export const getPublicKey = api(
 /** Internal endpoint used by the auth handler to validate session tokens. */
 export const validateToken = api(
 	{ expose: false, auth: false, method: "GET", path: "/auth/validate" },
-	async ({ token }: { token: string }): Promise<{ user_id: string }> => {
-		const row = await db.queryRow<{ user_id: string; expires_at: string }>`
-      SELECT user_id, expires_at
-      FROM sessions
-      WHERE token = ${token}
+	async ({
+		token,
+	}: {
+		token: string;
+	}): Promise<{ user_id: string; role: string }> => {
+		const row = await db.queryRow<{
+			user_id: string;
+			expires_at: string;
+			role: string;
+		}>`
+      SELECT s.user_id, s.expires_at, u.role
+      FROM sessions s
+      JOIN users u ON u.id = s.user_id
+      WHERE s.token = ${token}
     `;
 
 		if (!row) throw APIError.unauthenticated("invalid token");
@@ -337,7 +347,7 @@ export const validateToken = api(
 			throw APIError.unauthenticated("token expired");
 		}
 
-		return { user_id: row.user_id };
+		return { user_id: row.user_id, role: row.role };
 	},
 );
 
@@ -421,7 +431,7 @@ async function sendEmail(
 interface InviteRequest {
 	email: string;
 	name: string;
-	role?: "super_admin" | "admin" | "manager" | "user";
+	role?: "super_admin" | "admin" | "manager" | "finance" | "user";
 }
 
 /**
@@ -439,7 +449,7 @@ export const invite = api(
 			throw APIError.invalidArgument("email and name are required");
 
 		// Validate role
-		const validRoles = ["super_admin", "admin", "manager", "user"];
+		const validRoles = ["super_admin", "admin", "manager", "finance", "user"];
 		if (!validRoles.includes(role))
 			throw APIError.invalidArgument("invalid role");
 
@@ -764,5 +774,88 @@ export const me = api(
     `;
 		if (!user) throw APIError.notFound("user not found");
 		return user;
+	},
+);
+
+// ─── Internal cross-service helpers ───────────────────────────────────────────
+
+interface Recipient {
+	id: string;
+	email: string;
+	name: string;
+	role: string;
+}
+
+/**
+ * Internal: list active users matching any of the given roles.
+ * Used by other services (e.g. expenses) to resolve approval/notification
+ * recipients such as managers, admins, or finance.
+ */
+export const listByRoles = api(
+	{
+		expose: false,
+		auth: false,
+		method: "POST",
+		path: "/internal/users/by-roles",
+	},
+	async ({ roles }: { roles: string[] }): Promise<{ users: Recipient[] }> => {
+		const users: Recipient[] = [];
+		if (!roles || roles.length === 0) return { users };
+		const rows = db.query<Recipient>`
+      SELECT id, email, name, role
+      FROM users
+      WHERE is_active = TRUE AND role = ANY(${roles})
+      ORDER BY name
+    `;
+		for await (const row of rows) users.push(row);
+		return { users };
+	},
+);
+
+/**
+ * Internal: get a single user's contact details by id.
+ */
+export const getContact = api(
+	{
+		expose: false,
+		auth: false,
+		method: "GET",
+		path: "/internal/users/:id/contact",
+	},
+	async ({ id }: { id: string }): Promise<Recipient> => {
+		const row = await db.queryRow<Recipient>`
+      SELECT id, email, name, role FROM users WHERE id = ${id}
+    `;
+		if (!row) throw APIError.notFound("user not found");
+		return row;
+	},
+);
+
+/**
+ * Internal: send a notification email via Resend.
+ * Exposed to other services so email sending stays centralized in the user service.
+ */
+export const sendNotification = api(
+	{ expose: false, auth: false, method: "POST", path: "/internal/notify" },
+	async ({
+		to,
+		subject,
+		html,
+	}: {
+		to: string;
+		subject: string;
+		html: string;
+	}): Promise<{ ok: boolean }> => {
+		try {
+			await sendEmail(to, subject, html);
+			return { ok: true };
+		} catch (err) {
+			log.error("failed to send notification email", {
+				to,
+				subject,
+				error: String(err),
+			});
+			return { ok: false };
+		}
 	},
 );

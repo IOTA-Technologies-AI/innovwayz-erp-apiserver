@@ -10,6 +10,7 @@ interface AuthParams {
 // AuthData is available to all downstream services via auth.data().
 interface AuthData {
 	userID: string;
+	role: string;
 }
 
 /**
@@ -30,8 +31,8 @@ export const auth = authHandler<AuthParams, AuthData>(
 			throw APIError.unauthenticated("empty token");
 		}
 
-		const { user_id } = await validateToken({ token });
-		return { userID: user_id };
+		const { user_id, role } = await validateToken({ token });
+		return { userID: user_id, role };
 	},
 );
 
