@@ -356,12 +356,29 @@ interface ListExpensesParams {
 	status?: string;
 	category?: string;
 	employee_id?: string;
+	customer_id?: string;
+	customer_name?: string;
+	created_by?: string;
+	year?: number;
+	month?: number; // 1-12
+	quarter?: number; // 1-4
+	date_from?: string; // YYYY-MM-DD (inclusive)
+	date_to?: string; // YYYY-MM-DD (inclusive)
 	mine?: boolean;
+	limit?: number; // default 100, max 100
+	offset?: number;
+}
+
+interface ListExpensesResponse {
+	expenses: Expense[];
+	total: number;
+	limit: number;
+	offset: number;
 }
 
 export const listExpenses = api(
 	{ expose: true, auth: true, method: "GET", path: "/expenses" },
-	async (p: ListExpensesParams): Promise<{ expenses: Expense[] }> => {
+	async (p: ListExpensesParams): Promise<ListExpensesResponse> => {
 		const { userID, role } = getAuthData()!;
 
 		const clauses: string[] = [];
@@ -379,15 +396,83 @@ export const listExpenses = api(
 		if (p.status) add("status = $?", p.status);
 		if (p.category) add("category = $?", p.category);
 		if (p.employee_id) add("employee_id = $?", p.employee_id);
+		if (p.customer_id) add("customer_id = $?", p.customer_id);
+		if (p.customer_name) add("customer_name = $?", p.customer_name);
+		if (p.created_by) add("created_by = $?", p.created_by);
+		if (p.year) add("EXTRACT(YEAR FROM expense_date) = $?", p.year);
+		if (p.month) add("EXTRACT(MONTH FROM expense_date) = $?", p.month);
+		if (p.quarter) add("EXTRACT(QUARTER FROM expense_date) = $?", p.quarter);
+		if (p.date_from) add("expense_date >= $?", p.date_from);
+		if (p.date_to) add("expense_date <= $?", p.date_to);
 
 		const where = clauses.length ? `WHERE ${clauses.join(" AND ")}` : "";
-		const rows = db.rawQuery<Expense>(
-			`SELECT ${EXPENSE_COLUMNS} FROM expenses ${where} ORDER BY created_at DESC`,
+
+		// Total (before pagination) so the UI can render page controls.
+		const countRow = await db.rawQueryRow<{ n: number }>(
+			`SELECT COUNT(*)::int AS n FROM expenses ${where}`,
 			...args,
+		);
+		const total = countRow?.n ?? 0;
+
+		// Pagination — cap at 100 rows per request; newest first by default.
+		const limit = Math.min(Math.max(Number(p.limit) || 100, 1), 100);
+		const offset = Math.max(Number(p.offset) || 0, 0);
+		const pagedArgs = [...args, limit, offset];
+		const limitIdx = args.length + 1;
+		const offsetIdx = args.length + 2;
+
+		const rows = db.rawQuery<Expense>(
+			`SELECT ${EXPENSE_COLUMNS} FROM expenses ${where}
+       ORDER BY expense_date DESC, created_at DESC
+       LIMIT $${limitIdx} OFFSET $${offsetIdx}`,
+			...pagedArgs,
 		);
 		const expenses: Expense[] = [];
 		for await (const row of rows) expenses.push(row);
-		return { expenses };
+		return { expenses, total, limit, offset };
+	},
+);
+
+// ─── Filter option values (for dropdowns) ─────────────────────────────────────
+
+interface ExpenseFilterOptions {
+	customers: string[];
+	creators: { id: string; name: string | null }[];
+	years: number[];
+}
+
+export const expenseFilterOptions = api(
+	{ expose: true, auth: true, method: "GET", path: "/expenses-filters" },
+	async (): Promise<ExpenseFilterOptions> => {
+		const customers: string[] = [];
+		const cRows = db.query<{ customer_name: string }>`
+      SELECT DISTINCT customer_name FROM expenses
+      WHERE customer_name IS NOT NULL AND customer_name <> ''
+      ORDER BY customer_name
+    `;
+		for await (const r of cRows) customers.push(r.customer_name);
+
+		const creators: { id: string; name: string | null }[] = [];
+		const uRows = db.query<{
+			created_by: string;
+			created_by_name: string | null;
+		}>`
+      SELECT created_by, MAX(created_by_name) AS created_by_name
+      FROM expenses
+      GROUP BY created_by
+      ORDER BY created_by_name NULLS LAST
+    `;
+		for await (const r of uRows)
+			creators.push({ id: r.created_by, name: r.created_by_name });
+
+		const years: number[] = [];
+		const yRows = db.query<{ y: number }>`
+      SELECT DISTINCT EXTRACT(YEAR FROM expense_date)::int AS y
+      FROM expenses ORDER BY y DESC
+    `;
+		for await (const r of yRows) years.push(r.y);
+
+		return { customers, creators, years };
 	},
 );
 
