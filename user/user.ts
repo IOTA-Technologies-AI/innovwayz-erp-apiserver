@@ -859,3 +859,19 @@ export const sendNotification = api(
 		}
 	},
 );
+/**
+ * Internal: delete all active sessions for a user.
+ * Called by the permissions service when access rights change.
+ */
+export const invalidateSessionsForUser = api(
+	{
+		expose: false,
+		auth: false,
+		method: "POST",
+		path: "/internal/invalidate-sessions",
+	},
+	async ({ user_id }: { user_id: string }): Promise<{ ok: boolean }> => {
+		await db.exec`DELETE FROM sessions WHERE user_id = ${user_id}`;
+		return { ok: true };
+	},
+);
