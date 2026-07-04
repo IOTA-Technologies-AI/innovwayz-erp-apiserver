@@ -159,9 +159,9 @@ export const listEmployees = api(
         c.short_name                                                 AS customer_short_name,
         c.billing_months_per_year,
         COALESCE(e.billing_months_override, c.billing_months_per_year) AS effective_billing_months,
-        COALESCE(s.monthly_amount, 0)                                AS monthly_salary,
-        COALESCE(br.monthly_rate, 0)                                 AS monthly_billing,
-        COALESCE(br.annual_amount, 0)                                AS annual_billing,
+        COALESCE(s.monthly_amount, 0)::float8                         AS monthly_salary,
+        COALESCE(br.monthly_rate, 0)::float8                          AS monthly_billing,
+        COALESCE(br.annual_amount, 0)::float8                         AS annual_billing,
         COALESCE(br.billing_year, ${year})                           AS billing_year
       FROM employees e
       JOIN customers c ON e.customer_id = c.id
