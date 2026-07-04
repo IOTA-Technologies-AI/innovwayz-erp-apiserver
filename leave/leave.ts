@@ -343,13 +343,17 @@ interface CreateLeaveRequestInput {
 
 export const createLeaveRequest = api(
 	{ expose: true, method: "POST", path: "/leave-requests", auth: true },
-	async (input: CreateLeaveRequestInput): Promise<{ request: LeaveRequest }> => {
+	async (
+		input: CreateLeaveRequestInput,
+	): Promise<{ request: LeaveRequest }> => {
 		const { userID, role } = getAuthData()!;
 
 		let creatorName: string | null = null;
 		try {
 			creatorName = (await user.getContact({ id: userID })).name;
-		} catch { /* non-fatal */ }
+		} catch {
+			/* non-fatal */
+		}
 
 		const year = new Date(input.start_date).getFullYear();
 		const id = crypto.randomUUID();
@@ -459,7 +463,9 @@ interface UpdateLeaveRequestInput extends Partial<CreateLeaveRequestInput> {
 
 export const updateLeaveRequest = api(
 	{ expose: true, method: "PUT", path: "/leave-requests/:id", auth: true },
-	async (input: UpdateLeaveRequestInput): Promise<{ request: LeaveRequest }> => {
+	async (
+		input: UpdateLeaveRequestInput,
+	): Promise<{ request: LeaveRequest }> => {
 		const { userID, role } = getAuthData()!;
 		const req = await fetchRequest(input.id);
 		if (!isManager(role) && req.created_by !== userID)
@@ -489,14 +495,21 @@ export const updateLeaveRequest = api(
 // ─── Submit ───────────────────────────────────────────────────────────────────
 
 export const submitLeaveRequest = api(
-	{ expose: true, method: "POST", path: "/leave-requests/:id/submit", auth: true },
+	{
+		expose: true,
+		method: "POST",
+		path: "/leave-requests/:id/submit",
+		auth: true,
+	},
 	async ({ id }: { id: string }): Promise<{ request: LeaveRequest }> => {
 		const { userID, role } = getAuthData()!;
 		const req = await fetchRequest(id);
 		if (!isManager(role) && req.created_by !== userID)
 			throw APIError.permissionDenied("access denied");
 		if (req.status !== "draft")
-			throw APIError.failedPrecondition(`cannot submit a ${req.status} request`);
+			throw APIError.failedPrecondition(
+				`cannot submit a ${req.status} request`,
+			);
 
 		await db.exec`
 			UPDATE leave_requests
@@ -509,11 +522,11 @@ export const submitLeaveRequest = api(
 		const html = emailShell(
 			`Leave Request Submitted`,
 			erow("Reference", req.reference) +
-			erow("Employee", req.employee_name) +
-			erow("Type", typeLabel) +
-			erow("From", req.start_date) +
-			erow("To", req.end_date) +
-			erow("Days", String(req.total_days)),
+				erow("Employee", req.employee_name) +
+				erow("Type", typeLabel) +
+				erow("From", req.start_date) +
+				erow("To", req.end_date) +
+				erow("Days", String(req.total_days)),
 		);
 		notifyRoles(
 			["manager", "admin"],
@@ -528,14 +541,21 @@ export const submitLeaveRequest = api(
 // ─── Approve ──────────────────────────────────────────────────────────────────
 
 export const approveLeaveRequest = api(
-	{ expose: true, method: "POST", path: "/leave-requests/:id/approve", auth: true },
+	{
+		expose: true,
+		method: "POST",
+		path: "/leave-requests/:id/approve",
+		auth: true,
+	},
 	async ({ id }: { id: string }): Promise<{ request: LeaveRequest }> => {
 		const { userID, role } = getAuthData()!;
 		if (!isManager(role)) throw APIError.permissionDenied("managers only");
 
 		const req = await fetchRequest(id);
 		if (!["draft", "submitted"].includes(req.status))
-			throw APIError.failedPrecondition(`cannot approve a ${req.status} request`);
+			throw APIError.failedPrecondition(
+				`cannot approve a ${req.status} request`,
+			);
 
 		await db.exec`
 			UPDATE leave_requests
@@ -558,17 +578,13 @@ export const approveLeaveRequest = api(
 		const html = emailShell(
 			`Your leave request has been approved`,
 			erow("Reference", req.reference) +
-			erow("Type", typeLabel) +
-			erow("From", req.start_date) +
-			erow("To", req.end_date) +
-			erow("Days", String(req.total_days)) +
-			erow("Status", "Approved"),
+				erow("Type", typeLabel) +
+				erow("From", req.start_date) +
+				erow("To", req.end_date) +
+				erow("Days", String(req.total_days)) +
+				erow("Status", "Approved"),
 		);
-		notifyUser(
-			req.created_by,
-			`[Leave] Approved — ${typeLabel}`,
-			html,
-		);
+		notifyUser(req.created_by, `[Leave] Approved — ${typeLabel}`, html);
 
 		return { request: await fetchRequest(id) };
 	},
@@ -582,14 +598,21 @@ interface RejectLeaveInput {
 }
 
 export const rejectLeaveRequest = api(
-	{ expose: true, method: "POST", path: "/leave-requests/:id/reject", auth: true },
+	{
+		expose: true,
+		method: "POST",
+		path: "/leave-requests/:id/reject",
+		auth: true,
+	},
 	async (input: RejectLeaveInput): Promise<{ request: LeaveRequest }> => {
 		const { userID, role } = getAuthData()!;
 		if (!isManager(role)) throw APIError.permissionDenied("managers only");
 
 		const req = await fetchRequest(input.id);
 		if (!["draft", "submitted"].includes(req.status))
-			throw APIError.failedPrecondition(`cannot reject a ${req.status} request`);
+			throw APIError.failedPrecondition(
+				`cannot reject a ${req.status} request`,
+			);
 
 		await db.exec`
 			UPDATE leave_requests
@@ -606,10 +629,10 @@ export const rejectLeaveRequest = api(
 		const html = emailShell(
 			`Leave request rejected`,
 			erow("Reference", req.reference) +
-			erow("Type", typeLabel) +
-			erow("From", req.start_date) +
-			erow("To", req.end_date) +
-			(input.reason ? erow("Reason", input.reason) : ""),
+				erow("Type", typeLabel) +
+				erow("From", req.start_date) +
+				erow("To", req.end_date) +
+				(input.reason ? erow("Reason", input.reason) : ""),
 		);
 		notifyUser(req.created_by, `[Leave] Rejected — ${typeLabel}`, html);
 
@@ -620,7 +643,12 @@ export const rejectLeaveRequest = api(
 // ─── Cancel ───────────────────────────────────────────────────────────────────
 
 export const cancelLeaveRequest = api(
-	{ expose: true, method: "POST", path: "/leave-requests/:id/cancel", auth: true },
+	{
+		expose: true,
+		method: "POST",
+		path: "/leave-requests/:id/cancel",
+		auth: true,
+	},
 	async ({ id }: { id: string }): Promise<{ request: LeaveRequest }> => {
 		const { userID, role } = getAuthData()!;
 		const req = await fetchRequest(id);
@@ -660,7 +688,8 @@ export const deleteLeaveRequest = api(
 	{ expose: true, method: "DELETE", path: "/leave-requests/:id", auth: true },
 	async ({ id }: { id: string }): Promise<{ success: boolean }> => {
 		const { role } = getAuthData()!;
-		if (role !== "super_admin") throw APIError.permissionDenied("super_admin only");
+		if (role !== "super_admin")
+			throw APIError.permissionDenied("super_admin only");
 		await db.exec`DELETE FROM leave_requests WHERE id = ${id}`;
 		return { success: true };
 	},
@@ -669,7 +698,12 @@ export const deleteLeaveRequest = api(
 // ─── Events ───────────────────────────────────────────────────────────────────
 
 export const listLeaveEvents = api(
-	{ expose: true, method: "GET", path: "/leave-requests/:id/events", auth: true },
+	{
+		expose: true,
+		method: "GET",
+		path: "/leave-requests/:id/events",
+		auth: true,
+	},
 	async ({ id }: { id: string }): Promise<{ events: LeaveRequestEvent[] }> => {
 		const { userID, role } = getAuthData()!;
 		const req = await fetchRequest(id);
@@ -706,8 +740,12 @@ export const leaveStats = api(
 		const scope = isManager(role) ? "" : `WHERE created_by = '${userID}'`;
 
 		const r = await db.rawQueryRow<{
-			total: string; draft: string; submitted: string;
-			approved: string; rejected: string; cancelled: string;
+			total: string;
+			draft: string;
+			submitted: string;
+			approved: string;
+			rejected: string;
+			cancelled: string;
 			total_days_taken: string;
 		}>(
 			`SELECT
