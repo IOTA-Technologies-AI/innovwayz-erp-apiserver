@@ -121,9 +121,7 @@ async function notifyRoles(
 	try {
 		const { users } = await user.listByRoles({ roles });
 		await Promise.all(
-			users.map((u) =>
-				user.sendNotification({ to: u.email, subject, html }),
-			),
+			users.map((u) => user.sendNotification({ to: u.email, subject, html })),
 		);
 	} catch (err) {
 		log.error("failed to notify roles", { roles, error: String(err) });
@@ -150,7 +148,11 @@ const SAR = (n: number) =>
 		maximumFractionDigits: 2,
 	}).format(n);
 
-function emailShell(heading: string, bodyRows: string, ctaLabel?: string): string {
+function emailShell(
+	heading: string,
+	bodyRows: string,
+	ctaLabel?: string,
+): string {
 	return `<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
 <body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
@@ -283,15 +285,24 @@ export const createExpense = api(
 		if (req.amount === undefined || req.amount === null || req.amount < 0)
 			throw APIError.invalidArgument("amount must be a positive number");
 		const category = req.category === "employee" ? "employee" : "company";
-		const expenseClass = req.expense_class ?? (category === "employee" ? "employee" : "operational");
+		const expenseClass =
+			req.expense_class ??
+			(category === "employee" ? "employee" : "operational");
 		if (
-			!["petty", "infrastructure", "management", "operational", "employee", "other"].includes(
-				expenseClass,
-			)
+			![
+				"petty",
+				"infrastructure",
+				"management",
+				"operational",
+				"employee",
+				"other",
+			].includes(expenseClass)
 		)
 			throw APIError.invalidArgument("invalid expense_class");
 		if (category === "employee" && !req.employee_id)
-			throw APIError.invalidArgument("employee_id is required for employee expenses");
+			throw APIError.invalidArgument(
+				"employee_id is required for employee expenses",
+			);
 
 		let creatorName: string | null = null;
 		try {
