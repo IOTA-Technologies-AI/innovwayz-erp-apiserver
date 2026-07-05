@@ -1,4 +1,5 @@
 import { api, APIError } from "encore.dev/api";
+import { getAuthData } from "~encore/auth";
 import { appMeta } from "encore.dev";
 import { secret } from "encore.dev/config";
 import { Topic } from "encore.dev/pubsub";
@@ -334,9 +335,10 @@ export const validateToken = api(
 		const row = await db.queryRow<{
 			user_id: string;
 			expires_at: string;
+			last_active_at: string;
 			role: string;
 		}>`
-      SELECT s.user_id, s.expires_at, u.role
+      SELECT s.user_id, s.expires_at, s.last_active_at, u.role
       FROM sessions s
       JOIN users u ON u.id = s.user_id
       WHERE s.token = ${token}
@@ -346,6 +348,15 @@ export const validateToken = api(
 		if (new Date(row.expires_at) < new Date()) {
 			throw APIError.unauthenticated("token expired");
 		}
+
+		// Inactivity lock: if last activity was more than 6 hours ago
+		const sixHoursMs = 6 * 60 * 60 * 1000;
+		if (Date.now() - new Date(row.last_active_at).getTime() > sixHoursMs) {
+			throw APIError.unauthenticated("session_inactive");
+		}
+
+		// Extend session activity timestamp on every validated request
+		await db.exec`UPDATE sessions SET last_active_at = NOW() WHERE token = ${token}`;
 
 		return { user_id: row.user_id, role: row.role };
 	},
@@ -359,6 +370,156 @@ export const logout = api(
 	{ expose: true, auth: false, method: "POST", path: "/auth/logout" },
 	async ({ token }: { token: string }): Promise<{ ok: boolean }> => {
 		await db.exec`DELETE FROM sessions WHERE token = ${token}`;
+		return { ok: true };
+	},
+);
+
+// ─── Session lock / inactivity OTP ───────────────────────────────────────────
+
+/**
+ * Send an OTP to the user's email when their session is locked due to
+ * inactivity. The token is still present in DB (just inactive).
+ */
+export const sendLockOtp = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/lock-otp" },
+	async ({
+		token,
+	}: {
+		token: string;
+	}): Promise<{ ok: boolean; email: string }> => {
+		if (!token) throw APIError.invalidArgument("token is required");
+
+		// Find user from session — ignores last_active_at, only checks existence + expiry
+		const session = await db.queryRow<{
+			user_id: string;
+			expires_at: string;
+		}>`SELECT user_id, expires_at FROM sessions WHERE token = ${token}`;
+
+		if (!session) throw APIError.unauthenticated("invalid token");
+		if (new Date(session.expires_at) < new Date())
+			throw APIError.unauthenticated(
+				"session fully expired — please log in again",
+			);
+
+		const user = await db.queryRow<{ email: string; name: string }>`
+			SELECT email, name FROM users WHERE id = ${session.user_id}
+		`;
+		if (!user) throw APIError.notFound("user not found");
+
+		// Generate 6-digit OTP (10-minute expiry)
+		const code = String(Math.floor(100000 + Math.random() * 900000));
+		const otpId = crypto.randomUUID();
+		const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+
+		// Invalidate previous OTPs for this email
+		await db.exec`UPDATE otp_codes SET used_at = NOW() WHERE email = ${user.email} AND used_at IS NULL`;
+
+		await db.exec`
+			INSERT INTO otp_codes (id, email, code, expires_at)
+			VALUES (${otpId}, ${user.email}, ${code}, ${expiresAt.toISOString()})
+		`;
+
+		await sendEmail(
+			user.email,
+			"InnovWayz ERP — session verification code",
+			`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+        <tr>
+          <td style="background:#0f172a;border-radius:12px 12px 0 0;padding:28px 40px;text-align:center;">
+            <span style="color:#ffffff;font-size:22px;font-weight:700;">InnovWayz ERP</span>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#ffffff;padding:40px;border-left:1px solid #e2e8f0;border-right:1px solid #e2e8f0;">
+            <h2 style="margin:0 0 16px;color:#0f172a;font-size:22px;font-weight:700;">Session Verification</h2>
+            <p style="margin:0 0 12px;color:#475569;font-size:15px;line-height:1.6;">Hi <strong>${user.name}</strong>,</p>
+            <p style="margin:0 0 24px;color:#475569;font-size:15px;line-height:1.6;">
+              Your session was locked due to inactivity. Enter this code to resume your session.
+              It expires in <strong>10 minutes</strong>.
+            </p>
+            <table cellpadding="0" cellspacing="0" width="100%">
+              <tr><td align="center" style="padding:8px 0 28px;">
+                <div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:20px 36px;">
+                  <span style="font-size:42px;font-weight:800;letter-spacing:12px;color:#4f46e5;font-variant-numeric:tabular-nums;">${code}</span>
+                </div>
+              </td></tr>
+            </table>
+            <p style="margin:0;color:#94a3b8;font-size:13px;">If you did not request this, your account may be at risk — please contact your administrator.</p>
+          </td>
+        </tr>
+        <tr>
+          <td style="background:#f8fafc;border:1px solid #e2e8f0;border-top:none;border-radius:0 0 12px 12px;padding:20px 40px;text-align:center;">
+            <p style="margin:0;color:#94a3b8;font-size:12px;">&copy; ${new Date().getFullYear()} InnovWayz Technologies. All Rights Reserved.</p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`,
+		);
+
+		return { ok: true, email: user.email };
+	},
+);
+
+/**
+ * Unlock a locked session using an OTP sent to the user's email.
+ * Resets last_active_at so the session continues without issuing a new token.
+ */
+export const unlockSession = api(
+	{ expose: true, auth: false, method: "POST", path: "/auth/unlock-session" },
+	async ({
+		token,
+		email,
+		code,
+	}: {
+		token: string;
+		email: string;
+		code: string;
+	}): Promise<{ ok: boolean }> => {
+		if (!token || !email || !code)
+			throw APIError.invalidArgument("token, email and code are required");
+
+		// Validate OTP
+		const otp = await db.queryRow<{
+			id: string;
+			expires_at: string;
+			used_at: string | null;
+		}>`
+			SELECT id, expires_at, used_at
+			FROM otp_codes
+			WHERE email = ${email} AND code = ${code}
+			ORDER BY created_at DESC
+			LIMIT 1
+		`;
+
+		if (!otp || otp.used_at)
+			throw APIError.unauthenticated("invalid or already-used code");
+		if (new Date(otp.expires_at) < new Date())
+			throw APIError.unauthenticated("code has expired");
+
+		// Validate the session still exists and isn't fully expired
+		const session = await db.queryRow<{ expires_at: string }>`
+			SELECT expires_at FROM sessions WHERE token = ${token}
+		`;
+		if (!session) throw APIError.unauthenticated("session not found");
+		if (new Date(session.expires_at) < new Date())
+			throw APIError.unauthenticated(
+				"session fully expired — please log in again",
+			);
+
+		// Mark OTP as used
+		await db.exec`UPDATE otp_codes SET used_at = NOW() WHERE id = ${otp.id}`;
+
+		// Reset last_active_at — the session is now active again
+		await db.exec`UPDATE sessions SET last_active_at = NOW() WHERE token = ${token}`;
+
 		return { ok: true };
 	},
 );
@@ -592,6 +753,152 @@ export const acceptInvite = api(
     `;
 
 		return { token: sessionToken, user };
+	},
+);
+
+// ─── List pending invitations ─────────────────────────────────────────────────
+
+export interface InviteRecord {
+	email: string;
+	name: string;
+	created_at: string;
+	expires_at: string;
+	accepted_at: string | null;
+	is_expired: boolean;
+}
+
+export const listInvites = api(
+	{ expose: true, auth: true, method: "GET", path: "/auth/invites" },
+	async (): Promise<{ invites: InviteRecord[] }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role))
+			throw APIError.permissionDenied("admin only");
+
+		const rows = db.rawQuery<{
+			email: string;
+			name: string;
+			created_at: string;
+			expires_at: string;
+			accepted_at: string | null;
+		}>(
+			`SELECT email, name, created_at, expires_at, accepted_at
+			 FROM invitations ORDER BY created_at DESC`,
+		);
+		const invites: InviteRecord[] = [];
+		for await (const r of rows) {
+			invites.push({
+				...r,
+				is_expired: new Date(r.expires_at) < new Date() && !r.accepted_at,
+			});
+		}
+		return { invites };
+	},
+);
+
+// ─── Resend invitation ────────────────────────────────────────────────────────
+
+export const resendInvite = api(
+	{ expose: true, auth: true, method: "POST", path: "/auth/invites/resend" },
+	async ({ email }: { email: string }): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role))
+			throw APIError.permissionDenied("admin only");
+
+		// Fetch the user name
+		const userRow = await db.queryRow<{ name: string }>`
+			SELECT name FROM users WHERE email = ${email} AND is_active = FALSE
+		`;
+		if (!userRow)
+			throw APIError.notFound("pending invite not found for this email");
+
+		// Expire old invite tokens for this email
+		await db.exec`DELETE FROM invitations WHERE email = ${email}`;
+
+		// Create a fresh token valid 7 days
+		const token = crypto.randomBytes(32).toString("hex");
+		const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+		await db.exec`
+			INSERT INTO invitations (token, email, name, expires_at)
+			VALUES (${token}, ${email}, ${userRow.name}, ${expiresAt.toISOString()})
+		`;
+
+		const baseUrl = appUrl() || "https://erp.innovwayz.io";
+		const inviteLink = `${baseUrl}/auth/accept-invite?token=${token}`;
+		await sendEmail(
+			email,
+			"Your InnovWayz ERP invitation (resent)",
+			`<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;">
+    <tr><td align="center">
+      <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+        <tr><td style="background:#0f172a;border-radius:12px 12px 0 0;padding:28px 40px;text-align:center;">
+          <span style="color:#fff;font-size:22px;font-weight:700;">InnovWayz ERP</span>
+        </td></tr>
+        <tr><td style="background:#fff;padding:40px;">
+          <h2 style="margin:0 0 16px;color:#0f172a;">Invitation Resent</h2>
+          <p style="color:#475569;font-size:15px;">Hi <strong>${userRow.name}</strong>, here is your updated invitation link:</p>
+          <table cellpadding="0" cellspacing="0" width="100%">
+            <tr><td align="center" style="padding:16px 0;">
+              <a href="${inviteLink}" style="display:inline-block;background:#4f46e5;color:#fff;padding:14px 32px;border-radius:8px;text-decoration:none;font-size:15px;font-weight:600;">Accept Invitation</a>
+            </td></tr>
+          </table>
+          <p style="color:#94a3b8;font-size:13px;">Expires in 7 days.</p>
+        </td></tr>
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`,
+		);
+
+		return { ok: true };
+	},
+);
+
+// ─── Cancel invitation ────────────────────────────────────────────────────────
+
+export const cancelInvite = api(
+	{ expose: true, auth: true, method: "DELETE", path: "/auth/invites/:email" },
+	async ({ email }: { email: string }): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role))
+			throw APIError.permissionDenied("admin only");
+
+		await db.exec`DELETE FROM invitations WHERE email = ${email}`;
+		await db.exec`DELETE FROM users WHERE email = ${email} AND is_active = FALSE`;
+
+		return { ok: true };
+	},
+);
+
+// ─── List all portal users (with active status) ───────────────────────────────
+
+export interface PortalUser {
+	id: string;
+	email: string;
+	name: string;
+	role: string;
+	is_active: boolean;
+	created_at: string;
+}
+
+export const listPortalUsers = api(
+	{ expose: true, auth: true, method: "GET", path: "/users/all" },
+	async (): Promise<{ users: PortalUser[] }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role))
+			throw APIError.permissionDenied("admin only");
+
+		const rows = db.rawQuery<PortalUser>(
+			`SELECT id, email, name, role, is_active, created_at
+			 FROM users ORDER BY created_at DESC`,
+		);
+		const users: PortalUser[] = [];
+		for await (const r of rows) users.push(r);
+		return { users };
 	},
 );
 
