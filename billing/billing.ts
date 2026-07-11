@@ -104,6 +104,7 @@ interface Customer {
 	short_name: string;
 	billing_months_per_year: number;
 	notes: string | null;
+	created_at: string;
 }
 
 interface ListCustomersResponse {
@@ -114,12 +115,92 @@ export const listCustomers = api(
 	{ expose: true, auth: true, method: "GET", path: "/customers" },
 	async (): Promise<ListCustomersResponse> => {
 		const rows = db.query<Customer>`
-      SELECT id, name, short_name, billing_months_per_year, notes
+      SELECT id::text, name, short_name, billing_months_per_year, notes, created_at
       FROM customers ORDER BY name
     `;
 		const customers: Customer[] = [];
 		for await (const row of rows) customers.push(row);
 		return { customers };
+	},
+);
+
+export const createCustomer = api(
+	{ expose: true, auth: true, method: "POST", path: "/customers" },
+	async (req: {
+		name: string;
+		short_name: string;
+		billing_months_per_year?: number;
+		notes?: string;
+	}): Promise<Customer> => {
+		const { role } = getAuthData()!;
+		if (!["admin", "super_admin"].includes(role))
+			throw APIError.permissionDenied("Admin only");
+		if (!req.name || !req.short_name)
+			throw APIError.invalidArgument("name and short_name are required");
+
+		const row = await db.rawQueryRow<Customer>(
+			`INSERT INTO customers (name, short_name, billing_months_per_year, notes)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id::text, name, short_name, billing_months_per_year, notes, created_at`,
+			req.name, req.short_name,
+			req.billing_months_per_year ?? 12,
+			req.notes ?? null,
+		);
+		return row!;
+	},
+);
+
+export const updateCustomer = api(
+	{ expose: true, auth: true, method: "PUT", path: "/customers/:id" },
+	async (req: {
+		id: string;
+		name?: string;
+		short_name?: string;
+		billing_months_per_year?: number;
+		notes?: string;
+	}): Promise<Customer> => {
+		const { role } = getAuthData()!;
+		if (!["admin", "super_admin"].includes(role))
+			throw APIError.permissionDenied("Admin only");
+
+		const existing = await db.rawQueryRow<Customer>(
+			`SELECT id::text, name, short_name, billing_months_per_year, notes, created_at FROM customers WHERE id = $1`,
+			req.id,
+		);
+		if (!existing) throw APIError.notFound("Customer not found");
+
+		const row = await db.rawQueryRow<Customer>(
+			`UPDATE customers SET
+         name = $2, short_name = $3,
+         billing_months_per_year = $4, notes = $5
+       WHERE id = $1
+       RETURNING id::text, name, short_name, billing_months_per_year, notes, created_at`,
+			req.id,
+			req.name ?? existing.name,
+			req.short_name ?? existing.short_name,
+			req.billing_months_per_year ?? existing.billing_months_per_year,
+			req.notes !== undefined ? req.notes : existing.notes,
+		);
+		return row!;
+	},
+);
+
+export const deleteCustomer = api(
+	{ expose: true, auth: true, method: "DELETE", path: "/customers/:id" },
+	async (req: { id: string }): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (role !== "super_admin")
+			throw APIError.permissionDenied("Super Admin only");
+		// Prevent deletion if employees are assigned
+		const empCount = await db.rawQueryRow<{ count: number }>(
+			`SELECT COUNT(*)::int AS count FROM employees WHERE customer_id = $1`, req.id,
+		);
+		if ((empCount?.count ?? 0) > 0)
+			throw APIError.failedPrecondition(
+				`Cannot delete: ${empCount!.count} employee(s) are assigned to this customer`,
+			);
+		await db.exec`DELETE FROM customers WHERE id = ${req.id}`;
+		return { ok: true };
 	},
 );
 
