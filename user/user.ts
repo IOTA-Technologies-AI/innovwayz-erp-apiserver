@@ -443,23 +443,15 @@ export const sendLockOtp = api(
               It expires in <strong>10 minutes</strong>.
             </p>
             <table cellpadding="0" cellspacing="0" width="100%">
-              <tr><td align="center" style="padding:8px 0 16px;">
-                <div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:20px 36px;">
-                  <span style="font-size:42px;font-weight:800;letter-spacing:12px;color:#4f46e5;font-variant-numeric:tabular-nums;">${code}</span>
+              <tr><td align="center" style="padding:8px 0 12px;">
+                <p style="margin:0 0 10px;color:#64748b;font-size:13px;">Copy and paste this code on the verification page:</p>
+                <div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:24px 44px;border:2px dashed #c7d2fe;">
+                  <span style="font-size:48px;font-weight:800;letter-spacing:14px;color:#4f46e5;font-variant-numeric:tabular-nums;font-family:'Courier New',monospace;">${code}</span>
                 </div>
-              </td></tr>
-              <tr><td align="center" style="padding:0 0 8px;">
-                <p style="margin:0;color:#94a3b8;font-size:11px;letter-spacing:0.5px;text-transform:uppercase;">— or —</p>
-              </td></tr>
-              <tr><td align="center" style="padding:0 0 28px;">
-                <a href="${appUrl()}/auth/verify-otp?email=${encodeURIComponent(user.email)}&code=${code}&lock=1"
-                   style="display:inline-block;background:#4f46e5;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-size:15px;font-weight:600;">
-                  Return to ERP &amp; Unlock &rarr;
-                </a>
-                <p style="margin:6px 0 0;color:#94a3b8;font-size:11px;">Click to open the ERP — your code will be pre-filled automatically</p>
+                <p style="margin:10px 0 0;color:#94a3b8;font-size:12px;">Select the code above, copy it, then paste it on the verification screen that is open in your browser.</p>
               </td></tr>
             </table>
-            <p style="margin:0;color:#94a3b8;font-size:13px;">If you did not request this, your account may be at risk — please contact your administrator.</p>
+            <p style="margin:24px 0 0;color:#94a3b8;font-size:13px;">If you did not request this, your account may be at risk — please contact your administrator.</p>
           </td>
         </tr>
         <tr>
@@ -999,23 +991,15 @@ export const loginWithOtp = api(
             <p style="margin:0 0 12px;color:#475569;font-size:15px;line-height:1.6;">Hi <strong>${row.name}</strong>,</p>
             <p style="margin:0 0 24px;color:#475569;font-size:15px;line-height:1.6;">Enter this code in the app to complete sign in. It expires in <strong>10 minutes</strong>.</p>
             <table cellpadding="0" cellspacing="0" width="100%">
-              <tr><td align="center" style="padding:8px 0 16px;">
-                <div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:20px 36px;">
-                  <span style="font-size:42px;font-weight:800;letter-spacing:12px;color:#4f46e5;font-variant-numeric:tabular-nums;">${code}</span>
+              <tr><td align="center" style="padding:8px 0 12px;">
+                <p style="margin:0 0 10px;color:#64748b;font-size:13px;">Copy and paste this code on the verification page:</p>
+                <div style="display:inline-block;background:#f1f5f9;border-radius:12px;padding:24px 44px;border:2px dashed #c7d2fe;">
+                  <span style="font-size:48px;font-weight:800;letter-spacing:14px;color:#4f46e5;font-variant-numeric:tabular-nums;font-family:'Courier New',monospace;">${code}</span>
                 </div>
-              </td></tr>
-              <tr><td align="center" style="padding:0 0 8px;">
-                <p style="margin:0;color:#94a3b8;font-size:11px;letter-spacing:0.5px;text-transform:uppercase;">— or —</p>
-              </td></tr>
-              <tr><td align="center" style="padding:0 0 28px;">
-                <a href="${appUrl()}/auth/verify-otp?email=${encodeURIComponent(email)}&code=${code}"
-                   style="display:inline-block;background:#4f46e5;color:#ffffff;padding:14px 28px;border-radius:8px;text-decoration:none;font-size:15px;font-weight:600;">
-                  Open ERP &amp; Verify &rarr;
-                </a>
-                <p style="margin:6px 0 0;color:#94a3b8;font-size:11px;">Click to open the sign-in page with your code pre-filled</p>
+                <p style="margin:10px 0 0;color:#94a3b8;font-size:12px;">Select the code above, copy it, then paste it on the sign-in page that&rsquo;s already open in your browser.</p>
               </td></tr>
             </table>
-            <p style="margin:0;color:#94a3b8;font-size:13px;line-height:1.5;">If you didn&rsquo;t try to sign in, you can safely ignore this email.</p>
+            <p style="margin:24px 0 0;color:#94a3b8;font-size:13px;line-height:1.5;">If you didn&rsquo;t try to sign in, you can safely ignore this email.</p>
           </td>
         </tr>
 
