@@ -443,3 +443,109 @@ export const updateEmployee = api(
 		return result!;
 	},
 );
+// ─── BDM ↔ Employee Assignments ───────────────────────────────────────────────
+
+export interface BdmAssignment {
+	bdm_user_id: string;
+	employee_id: string;
+	employee_name: string;
+	customer_name: string | null;
+	assigned_by: string | null;
+	assigned_at: string;
+}
+
+/** Admin: list all BDM→employee assignments (optionally filter by BDM). */
+export const listBdmAssignments = api(
+	{ expose: true, auth: true, method: "GET", path: "/bdm/assignments" },
+	async (req: {
+		bdm_user_id?: string;
+	}): Promise<{ assignments: BdmAssignment[] }> => {
+		const { role } = getAuthData()!;
+		if (!["admin", "super_admin"].includes(role))
+			throw APIError.permissionDenied("Admin only");
+
+		const rows = db.rawQuery<BdmAssignment>(
+			`SELECT a.bdm_user_id, a.employee_id::text, e.name AS employee_name,
+              c.name AS customer_name, a.assigned_by, a.assigned_at
+         FROM bdm_assignments a
+         JOIN employees e ON e.id = a.employee_id
+         LEFT JOIN customers c ON c.id = e.customer_id
+         WHERE ($1::text IS NULL OR a.bdm_user_id = $1)
+         ORDER BY e.name`,
+			req.bdm_user_id ?? null,
+		);
+		const assignments: BdmAssignment[] = [];
+		for await (const row of rows) assignments.push(row);
+		return { assignments };
+	},
+);
+
+/** BDM: get my own assigned employees. */
+export const getMyBdmEmployees = api(
+	{ expose: true, auth: true, method: "GET", path: "/bdm/my-employees" },
+	async (): Promise<{ assignments: BdmAssignment[] }> => {
+		const { userID } = getAuthData()!;
+		const rows = db.rawQuery<BdmAssignment>(
+			`SELECT a.bdm_user_id, a.employee_id::text, e.name AS employee_name,
+              c.name AS customer_name, a.assigned_by, a.assigned_at
+         FROM bdm_assignments a
+         JOIN employees e ON e.id = a.employee_id
+         LEFT JOIN customers c ON c.id = e.customer_id
+         WHERE a.bdm_user_id = $1
+         ORDER BY e.name`,
+			userID,
+		);
+		const assignments: BdmAssignment[] = [];
+		for await (const row of rows) assignments.push(row);
+		return { assignments };
+	},
+);
+
+/** Admin: assign one or more employees to a BDM (upsert). */
+export const assignEmployeesToBdm = api(
+	{ expose: true, auth: true, method: "POST", path: "/bdm/assignments" },
+	async (req: {
+		bdm_user_id: string;
+		employee_ids: string[];
+	}): Promise<{ assigned: number }> => {
+		const { userID, role } = getAuthData()!;
+		if (!["admin", "super_admin"].includes(role))
+			throw APIError.permissionDenied("Admin only");
+		if (!req.employee_ids.length)
+			throw APIError.invalidArgument("employee_ids must not be empty");
+
+		let assigned = 0;
+		for (const empId of req.employee_ids) {
+			await db.exec`
+        INSERT INTO bdm_assignments (bdm_user_id, employee_id, assigned_by)
+        VALUES (${req.bdm_user_id}, ${empId}::uuid, ${userID})
+        ON CONFLICT (bdm_user_id, employee_id) DO NOTHING
+      `;
+			assigned++;
+		}
+		return { assigned };
+	},
+);
+
+/** Admin: remove an employee from a BDM. */
+export const removeEmployeeFromBdm = api(
+	{
+		expose: true,
+		auth: true,
+		method: "DELETE",
+		path: "/bdm/assignments/:bdmUserId/:employeeId",
+	},
+	async (req: {
+		bdmUserId: string;
+		employeeId: string;
+	}): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!["admin", "super_admin"].includes(role))
+			throw APIError.permissionDenied("Admin only");
+		await db.exec`
+      DELETE FROM bdm_assignments
+      WHERE bdm_user_id = ${req.bdmUserId} AND employee_id = ${req.employeeId}::uuid
+    `;
+		return { ok: true };
+	},
+);

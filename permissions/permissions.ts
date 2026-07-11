@@ -75,6 +75,17 @@ const DEFAULT_ROUTES: Record<string, string[]> = {
 		"/admin/main/profile/overview",
 		"/admin/main/profile/settings",
 	],
+	// BDMs see only Sales pages and their own profile
+	bdm: [
+		"/admin/dashboards/default",
+		"/admin/main/sales/pipeline",
+		"/admin/main/sales/deals",
+		"/admin/main/sales/contacts",
+		"/admin/main/sales/activities",
+		"/admin/main/sales/reports",
+		"/admin/main/profile/overview",
+		"/admin/main/profile/settings",
+	],
 };
 
 function defaultsForRole(role: string): string[] {

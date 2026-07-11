@@ -20,6 +20,15 @@ const db = new SQLDatabase("sales", { migrations: "./migrations" });
 function canManage(role: string): boolean {
 	return ["admin", "super_admin", "manager"].includes(role);
 }
+/** BDMs see only their own data (deals/contacts they own). */
+function bdmOwnerFilter(
+	role: string,
+	userID: string,
+	requestedOwnerId?: string,
+): string | null {
+	if (role === "bdm") return userID; // always locked to self
+	return requestedOwnerId ?? null; // other roles can filter freely
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -153,6 +162,8 @@ export const listContacts = api(
 		limit?: number;
 		offset?: number;
 	}): Promise<{ contacts: SalesContact[]; total: number }> => {
+		const { userID, role } = getAuthData()!;
+		const ownerFilter = bdmOwnerFilter(role, userID, req.owner_id);
 		const limit = Math.min(req.limit ?? 50, 200);
 		const offset = req.offset ?? 0;
 
@@ -170,7 +181,7 @@ export const listContacts = api(
        ORDER BY created_at DESC
        LIMIT $4 OFFSET $5`,
 			req.contact_type ?? null,
-			req.owner_id ?? null,
+			ownerFilter,
 			req.search ?? null,
 			limit,
 			offset,
@@ -184,7 +195,7 @@ export const listContacts = api(
          AND ($2::text IS NULL OR owner_id = $2)
          AND ($3::text IS NULL OR (full_name ILIKE '%' || $3 || '%' OR company ILIKE '%' || $3 || '%'))`,
 			req.contact_type ?? null,
-			req.owner_id ?? null,
+			ownerFilter,
 			req.search ?? null,
 		);
 		return { contacts, total: countRow?.count ?? 0 };
@@ -318,6 +329,8 @@ export const listDeals = api(
 		limit?: number;
 		offset?: number;
 	}): Promise<{ deals: SalesDeal[]; total: number }> => {
+		const { userID, role } = getAuthData()!;
+		const ownerFilter = bdmOwnerFilter(role, userID, req.owner_id);
 		const limit = Math.min(req.limit ?? 100, 500);
 		const offset = req.offset ?? 0;
 
@@ -333,7 +346,7 @@ export const listDeals = api(
        ORDER BY updated_at DESC
        LIMIT $6 OFFSET $7`,
 			req.stage ?? null,
-			req.owner_id ?? null,
+			ownerFilter,
 			req.year ?? null,
 			req.quarter ?? null,
 			req.search ?? null,
@@ -350,7 +363,7 @@ export const listDeals = api(
          AND ($3::int  IS NULL OR EXTRACT(YEAR    FROM expected_close_date) = $3)
          AND ($4::int  IS NULL OR EXTRACT(QUARTER FROM expected_close_date) = $4)`,
 			req.stage ?? null,
-			req.owner_id ?? null,
+			ownerFilter,
 			req.year ?? null,
 			req.quarter ?? null,
 		);
@@ -396,8 +409,11 @@ export const createDeal = api(
 		owner_name?: string;
 		description?: string;
 	}): Promise<SalesDeal> => {
-		const { userID } = getAuthData()!;
+		const { userID, role } = getAuthData()!;
 		if (!req.title) throw APIError.invalidArgument("title is required");
+		// BDMs are always the owner of deals they create
+		const ownerId = role === "bdm" ? userID : (req.owner_id ?? null);
+		const ownerName = req.owner_name ?? null;
 		const stage = req.stage ?? "lead";
 		const id = crypto.randomUUID();
 		const seqRow = await db.rawQueryRow<{ nextval: string }>(
@@ -423,8 +439,8 @@ export const createDeal = api(
 			stage,
 			req.probability ?? STAGE_PROBABILITY[stage],
 			req.expected_close_date ?? null,
-			req.owner_id ?? null,
-			req.owner_name ?? null,
+			ownerId,
+			ownerName,
 			req.description ?? null,
 			userID,
 		);

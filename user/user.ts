@@ -619,7 +619,14 @@ export const invite = api(
 			);
 
 		// Validate role
-		const validRoles = ["super_admin", "admin", "manager", "finance", "user"];
+		const validRoles = [
+			"super_admin",
+			"admin",
+			"manager",
+			"finance",
+			"user",
+			"bdm",
+		];
 		if (!validRoles.includes(role))
 			throw APIError.invalidArgument("invalid role");
 
