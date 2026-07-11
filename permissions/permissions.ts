@@ -56,6 +56,13 @@ const DEFAULT_ROUTES: Record<string, string[]> = {
 		"/admin/main/salaries",
 		"/admin/main/invoices",
 		"/admin/main/profit-margin",
+		"/admin/main/financial/dashboard",
+		"/admin/main/financial/chart-of-accounts",
+		"/admin/main/financial/journal-entries",
+		"/admin/main/financial/trial-balance",
+		"/admin/main/financial/profit-loss",
+		"/admin/main/financial/balance-sheet",
+		"/admin/main/financial/disbursements",
 		"/admin/main/profile/overview",
 		"/admin/main/profile/settings",
 	],
@@ -194,14 +201,14 @@ export const setUserPermissions = api(
 		}
 
 		// Invalidate user's sessions → they must re-login
-		try {
-			await user.invalidateSessionsForUser({ user_id: userId });
-		} catch (err) {
-			log.error("failed to invalidate sessions", {
-				userId,
-				error: String(err),
+		void user
+			.invalidateSessionsForUser({ user_id: userId })
+			.catch((err: unknown) => {
+				log.error("failed to invalidate sessions", {
+					userId,
+					error: String(err),
+				});
 			});
-		}
 
 		return { ok: true };
 	},
@@ -219,14 +226,14 @@ export const resetUserPermissions = api(
 
 		await db.exec`DELETE FROM user_permissions WHERE user_id = ${userId}`;
 
-		try {
-			await user.invalidateSessionsForUser({ user_id: userId });
-		} catch (err) {
-			log.error("failed to invalidate sessions", {
-				userId,
-				error: String(err),
+		void user
+			.invalidateSessionsForUser({ user_id: userId })
+			.catch((err: unknown) => {
+				log.error("failed to invalidate sessions", {
+					userId,
+					error: String(err),
+				});
 			});
-		}
 
 		return { ok: true };
 	},

@@ -619,6 +619,13 @@ export const invite = api(
 		if (!email || !name)
 			throw APIError.invalidArgument("email and name are required");
 
+		// Restrict invitations to @innovwayz.com domain only
+		const emailDomain = email.split("@")[1]?.toLowerCase();
+		if (emailDomain !== "innovwayz.com")
+			throw APIError.invalidArgument(
+				"invitations are restricted to @innovwayz.com email addresses",
+			);
+
 		// Validate role
 		const validRoles = ["super_admin", "admin", "manager", "finance", "user"];
 		if (!validRoles.includes(role))
@@ -1199,6 +1206,225 @@ export const invalidateSessionsForUser = api(
 	},
 	async ({ user_id }: { user_id: string }): Promise<{ ok: boolean }> => {
 		await db.exec`DELETE FROM sessions WHERE user_id = ${user_id}`;
+		// Write audit entry for the session flush
+		void writeAuditLog({
+			user_id,
+			action: "session_flushed",
+			resource: "/internal/invalidate-sessions",
+			details: { reason: "permission_change" },
+			result: "success",
+			log_level: "info",
+		}).catch(() => {
+			/* non-critical */
+		});
+		return { ok: true };
+	},
+);
+
+// ─── Audit Log helpers & endpoints ───────────────────────────────────────────
+
+/** Internal helper: check current log level from system_settings. */
+async function getAuditLogLevel(): Promise<"production" | "debug" | "verbose"> {
+	try {
+		const row = await db.queryRow<{ value: string }>`
+      SELECT value FROM system_settings WHERE key = 'audit_log_level'
+    `;
+		const v = row?.value ?? "production";
+		if (v === "debug" || v === "verbose" || v === "production") return v;
+		return "production";
+	} catch {
+		return "production";
+	}
+}
+
+/**
+ * Internal helper: write an audit log entry.
+ * Respects the configured log level:
+ *   production → only 'info' events written
+ *   debug      → 'info' + 'debug' events
+ *   verbose    → all events
+ */
+export async function writeAuditLog(params: {
+	user_id?: string;
+	user_email?: string;
+	user_name?: string;
+	action: string;
+	resource?: string;
+	details?: Record<string, unknown>;
+	ip_address?: string;
+	user_agent?: string;
+	result?: string;
+	log_level?: string;
+}): Promise<void> {
+	const level = (params.log_level ?? "info") as string;
+	const currentLevel = await getAuditLogLevel();
+
+	// Skip events that are too verbose for current log level
+	if (currentLevel === "production" && level !== "info") return;
+	if (currentLevel === "debug" && level === "verbose") return;
+
+	const id = crypto.randomUUID();
+	await db.exec`
+    INSERT INTO audit_log
+      (id, user_id, user_email, user_name, action, resource, details,
+       ip_address, user_agent, result, log_level)
+    VALUES (
+      ${id},
+      ${params.user_id ?? null},
+      ${params.user_email ?? null},
+      ${params.user_name ?? null},
+      ${params.action},
+      ${params.resource ?? null},
+      ${params.details ? JSON.stringify(params.details) : null},
+      ${params.ip_address ?? null},
+      ${params.user_agent ?? null},
+      ${params.result ?? "success"},
+      ${level}
+    )
+  `;
+}
+
+export interface AuditLogEntry {
+	id: string;
+	user_id: string | null;
+	user_email: string | null;
+	user_name: string | null;
+	action: string;
+	resource: string | null;
+	details: string | null;
+	ip_address: string | null;
+	user_agent: string | null;
+	result: string;
+	log_level: string;
+	created_at: string;
+}
+
+/**
+ * Internal: write audit event — callable by other Encore services.
+ */
+export const writeAuditEvent = api(
+	{ expose: false, auth: false, method: "POST", path: "/internal/audit/write" },
+	async (params: {
+		user_id?: string;
+		user_email?: string;
+		user_name?: string;
+		action: string;
+		resource?: string;
+		details?: Record<string, unknown>;
+		ip_address?: string;
+		user_agent?: string;
+		result?: string;
+		log_level?: string;
+	}): Promise<{ ok: boolean }> => {
+		await writeAuditLog(params);
+		return { ok: true };
+	},
+);
+
+/**
+ * POST /auth/audit — public endpoint the Next.js middleware can call
+ * to log page_access_denied events (no auth required — user may not have session).
+ */
+export const logPageDenied = api(
+	{
+		expose: true,
+		auth: false,
+		method: "POST",
+		path: "/auth/audit/page-denied",
+	},
+	async (req: {
+		user_id?: string;
+		user_email?: string;
+		user_name?: string;
+		resource: string;
+		ip_address?: string;
+		user_agent?: string;
+	}): Promise<{ ok: boolean }> => {
+		await writeAuditLog({
+			...req,
+			action: "page_access_denied",
+			result: "denied",
+			log_level: "info",
+		});
+		return { ok: true };
+	},
+);
+
+/** GET /audit-log — admin/super_admin only. */
+export const listAuditLog = api(
+	{ expose: true, auth: true, method: "GET", path: "/audit-log" },
+	async (req: {
+		limit?: number;
+		offset?: number;
+		action?: string;
+		result?: string;
+		user_id?: string;
+	}): Promise<{ entries: AuditLogEntry[]; total: number }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role.trim()))
+			throw APIError.permissionDenied("admin only");
+
+		const limit = Math.min(req.limit ?? 100, 500);
+		const offset = req.offset ?? 0;
+
+		type CountRow = { count: number };
+		const countRow = await db.rawQueryRow<CountRow>(
+			`SELECT COUNT(*)::int AS count FROM audit_log`,
+		);
+		const total = countRow?.count ?? 0;
+
+		const rows = db.rawQuery<AuditLogEntry>(
+			`SELECT id, user_id, user_email, user_name, action, resource, details,
+       ip_address, user_agent, result, log_level, created_at
+       FROM audit_log
+       ORDER BY created_at DESC
+       LIMIT $1 OFFSET $2`,
+			limit,
+			offset,
+		);
+		const entries: AuditLogEntry[] = [];
+		for await (const row of rows) entries.push(row);
+		return { entries, total };
+	},
+);
+
+/** GET /audit-log/settings — get current audit log level (admin). */
+export const getAuditSettings = api(
+	{ expose: true, auth: true, method: "GET", path: "/audit-log/settings" },
+	async (): Promise<{ log_level: string }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role.trim()))
+			throw APIError.permissionDenied("admin only");
+		return { log_level: await getAuditLogLevel() };
+	},
+);
+
+/** POST /audit-log/settings — update log level (super_admin only). */
+export const setAuditSettings = api(
+	{ expose: true, auth: true, method: "POST", path: "/audit-log/settings" },
+	async (req: { log_level: string }): Promise<{ ok: boolean }> => {
+		const { userID, role } = getAuthData()!;
+		if (role !== "super_admin")
+			throw APIError.permissionDenied("super_admin only");
+		const valid = ["production", "debug", "verbose"];
+		if (!valid.includes(req.log_level))
+			throw APIError.invalidArgument(
+				`log_level must be one of: ${valid.join(", ")}`,
+			);
+		await db.exec`
+      INSERT INTO system_settings (key, value, updated_by, updated_at)
+      VALUES ('audit_log_level', ${req.log_level}, ${userID}, NOW())
+      ON CONFLICT (key) DO UPDATE
+        SET value = EXCLUDED.value, updated_by = EXCLUDED.updated_by, updated_at = NOW()
+    `;
+		await writeAuditLog({
+			user_id: userID,
+			action: "audit_settings_changed",
+			resource: "/audit-log/settings",
+			details: { new_level: req.log_level },
+			result: "success",
+			log_level: "info",
+		});
 		return { ok: true };
 	},
 );

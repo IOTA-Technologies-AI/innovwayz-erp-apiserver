@@ -185,6 +185,20 @@ export interface BalanceSheetResult {
 	is_balanced: boolean;
 }
 
+export interface PartnerDraw {
+	id: string;
+	partner_id: string;
+	fiscal_period: string;
+	amount: number;
+	drawn_by_name: string | null;
+	reference: string | null;
+	notes: string | null;
+	draw_date: string;
+	created_by: string;
+	created_by_name: string | null;
+	created_at: string;
+}
+
 export interface PartnerDisbursement {
 	partner_id: string;
 	partner_name: string;
@@ -192,6 +206,9 @@ export interface PartnerDisbursement {
 	associated_account: string;
 	is_org_reserve: boolean;
 	allocated_amount: number;
+	total_drawn: number; // sum of draws this period
+	available_balance: number; // allocated_amount - total_drawn
+	draws: PartnerDraw[]; // draw history for this period
 }
 
 export interface DisbursementResult {
@@ -203,6 +220,8 @@ export interface DisbursementResult {
 	disbursements: PartnerDisbursement[];
 	can_disburse: boolean;
 	blocking_reason: string | null;
+	total_drawn: number; // sum of all partner draws this period
+	total_reserved: number; // total accrued but not yet drawn
 }
 
 export interface PartnerCapitalAccount {
@@ -968,10 +987,12 @@ export const getDisbursements = api(
 				disbursements: [],
 				can_disburse: false,
 				blocking_reason: `Trial Balance is unbalanced (Δ ${Math.abs(debitSum - creditSum).toFixed(2)}). Resolve before disbursement.`,
+				total_drawn: 0,
+				total_reserved: 0,
 			};
 		}
 
-		// Compute P&L
+		// Compute P&L (tax_provision excluded — all ledger amounts are net)
 		const pnl = await getProfitAndLoss({ fiscal_period: req.fiscal_period });
 
 		if (pnl.net_profit <= 0) {
@@ -984,11 +1005,32 @@ export const getDisbursements = api(
 				disbursements: [],
 				can_disburse: false,
 				blocking_reason: `Net Profit is ${pnl.net_profit <= 0 ? "zero or negative" : "insufficient"}. No distribution possible.`,
+				total_drawn: 0,
+				total_reserved: 0,
 			};
 		}
 
 		const retainedEarnings = pnl.net_profit * 0.2;
 		const distributablePool = pnl.net_profit * 0.8;
+
+		// Fetch all partner draws for this period in one query
+		const drawRows = db.query<PartnerDraw>`
+      SELECT id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes,
+             draw_date::text AS draw_date, created_by, created_by_name, created_at
+      FROM partner_draws
+      WHERE fiscal_period = ${req.fiscal_period}
+      ORDER BY draw_date ASC, created_at ASC
+    `;
+		const allDraws: PartnerDraw[] = [];
+		for await (const row of drawRows) allDraws.push(row);
+
+		// Group draws by partner
+		const drawsByPartner = new Map<string, PartnerDraw[]>();
+		for (const draw of allDraws) {
+			if (!drawsByPartner.has(draw.partner_id))
+				drawsByPartner.set(draw.partner_id, []);
+			drawsByPartner.get(draw.partner_id)!.push(draw);
+		}
 
 		// Fetch partner matrix
 		const partnerRows = db.query<PartnerCapitalAccount>`
@@ -999,17 +1041,37 @@ export const getDisbursements = api(
 		const partners: PartnerCapitalAccount[] = [];
 		for await (const row of partnerRows) partners.push(row);
 
-		const disbursements: PartnerDisbursement[] = partners.map((p) => ({
-			partner_id: p.id,
-			partner_name: p.partner_name,
-			equity_percentage: Number(p.equity_percentage),
-			associated_account: p.associated_account,
-			is_org_reserve: p.is_org_reserve,
-			allocated_amount:
+		const disbursements: PartnerDisbursement[] = partners.map((p) => {
+			const partnerDraws = drawsByPartner.get(p.id) ?? [];
+			const totalDrawn =
+				Math.round(
+					partnerDraws.reduce((s, d) => s + Number(d.amount), 0) * 100,
+				) / 100;
+			const allocatedAmount =
 				Math.round(
 					distributablePool * (Number(p.equity_percentage) / 100) * 100,
-				) / 100,
-		}));
+				) / 100;
+			const availableBalance =
+				Math.round((allocatedAmount - totalDrawn) * 100) / 100;
+
+			return {
+				partner_id: p.id,
+				partner_name: p.partner_name,
+				equity_percentage: Number(p.equity_percentage),
+				associated_account: p.associated_account,
+				is_org_reserve: p.is_org_reserve,
+				allocated_amount: allocatedAmount,
+				total_drawn: totalDrawn,
+				available_balance: availableBalance,
+				draws: partnerDraws,
+			};
+		});
+
+		const totalDrawn = disbursements.reduce((s, d) => s + d.total_drawn, 0);
+		const totalReserved = disbursements.reduce(
+			(s, d) => s + Math.max(0, d.available_balance),
+			0,
+		);
 
 		return {
 			period: req.fiscal_period,
@@ -1020,6 +1082,8 @@ export const getDisbursements = api(
 			disbursements,
 			can_disburse: true,
 			blocking_reason: null,
+			total_drawn: Math.round(totalDrawn * 100) / 100,
+			total_reserved: Math.round(totalReserved * 100) / 100,
 		};
 	},
 );
@@ -1037,6 +1101,114 @@ export const listPartners = api(
 		const partners: PartnerCapitalAccount[] = [];
 		for await (const row of rows) partners.push(row);
 		return { partners };
+	},
+);
+
+// ─── 10b. Partner Draws ────────────────────────────────────────────────────────
+
+export const recordDraw = api(
+	{
+		expose: true,
+		auth: true,
+		method: "POST",
+		path: "/financial/partner-draws",
+	},
+	async (req: {
+		partner_id: string;
+		fiscal_period: string;
+		amount: number;
+		drawn_by_name?: string;
+		reference?: string;
+		notes?: string;
+		draw_date?: string;
+	}): Promise<PartnerDraw> => {
+		const { userID, role } = getAuthData()!;
+		if (!canManage(role))
+			throw APIError.permissionDenied("Finance or Admin role required");
+
+		if (!/^\d{4}-\d{2}$/.test(req.fiscal_period))
+			throw APIError.invalidArgument("fiscal_period must be in YYYY-MM format");
+		if (req.amount <= 0)
+			throw APIError.invalidArgument("draw amount must be positive");
+
+		const partner = await db.queryRow<{ id: string; partner_name: string }>`
+      SELECT id, partner_name FROM partner_capital_accounts WHERE id = ${req.partner_id}
+    `;
+		if (!partner) throw APIError.notFound("Partner not found");
+
+		const id = crypto.randomUUID();
+		const drawDate = req.draw_date ?? new Date().toISOString().slice(0, 10);
+
+		const contact = await db
+			.rawQueryRow<{
+				name: string | null;
+			}>(`SELECT name FROM users WHERE id = $1 LIMIT 1`, userID)
+			.catch(() => ({ name: null as string | null }));
+
+		const row = await db.queryRow<PartnerDraw>`
+      INSERT INTO partner_draws
+        (id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes, draw_date, created_by, created_by_name)
+      VALUES (
+        ${id}, ${req.partner_id}, ${req.fiscal_period}, ${req.amount},
+        ${req.drawn_by_name ?? null}, ${req.reference ?? null}, ${req.notes ?? null},
+        ${drawDate}::date, ${userID}, ${contact?.name ?? null}
+      )
+      RETURNING id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes,
+                draw_date::text AS draw_date, created_by, created_by_name, created_at
+    `;
+
+		await audit("partner_draws", id, "create", userID, contact?.name ?? null, {
+			partner: partner.partner_name,
+			amount: req.amount,
+			fiscal_period: req.fiscal_period,
+			drawn_by_name: req.drawn_by_name,
+		});
+
+		return row!;
+	},
+);
+
+export const listDraws = api(
+	{ expose: true, auth: true, method: "GET", path: "/financial/partner-draws" },
+	async (req: {
+		fiscal_period?: string;
+		partner_id?: string;
+	}): Promise<{ draws: PartnerDraw[] }> => {
+		let draws: PartnerDraw[];
+
+		if (req.fiscal_period && req.partner_id) {
+			const rows = db.query<PartnerDraw>`
+        SELECT id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes,
+               draw_date::text AS draw_date, created_by, created_by_name, created_at
+        FROM partner_draws
+        WHERE fiscal_period = ${req.fiscal_period} AND partner_id = ${req.partner_id}
+        ORDER BY draw_date ASC, created_at ASC
+      `;
+			draws = [];
+			for await (const row of rows) draws.push(row);
+		} else if (req.fiscal_period) {
+			const rows = db.query<PartnerDraw>`
+        SELECT id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes,
+               draw_date::text AS draw_date, created_by, created_by_name, created_at
+        FROM partner_draws
+        WHERE fiscal_period = ${req.fiscal_period}
+        ORDER BY draw_date ASC, created_at ASC
+      `;
+			draws = [];
+			for await (const row of rows) draws.push(row);
+		} else {
+			const rows = db.query<PartnerDraw>`
+        SELECT id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes,
+               draw_date::text AS draw_date, created_by, created_by_name, created_at
+        FROM partner_draws
+        ORDER BY fiscal_period DESC, draw_date DESC, created_at DESC
+        LIMIT 200
+      `;
+			draws = [];
+			for await (const row of rows) draws.push(row);
+		}
+
+		return { draws };
 	},
 );
 
