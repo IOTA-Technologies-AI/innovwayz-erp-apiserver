@@ -918,6 +918,45 @@ export const listPortalUsers = api(
 	},
 );
 
+// ─── Active sessions (admin) ─────────────────────────────────────────────────
+
+export interface ActiveSession {
+	user_id: string;
+	name: string;
+	email: string;
+	role: string;
+	created_at: string;
+	last_active_at: string;
+	expires_at: string;
+}
+
+/**
+ * Admin: list currently-active sessions.
+ * "Active" mirrors the auth rules — the session is not expired and was used
+ * within the 6-hour inactivity window. Session tokens are never returned.
+ */
+export const listActiveSessions = api(
+	{ expose: true, auth: true, method: "GET", path: "/auth/sessions" },
+	async (): Promise<{ sessions: ActiveSession[] }> => {
+		const { role } = getAuthData()!;
+		if (!["super_admin", "admin"].includes(role))
+			throw APIError.permissionDenied("admin only");
+
+		const rows = db.rawQuery<ActiveSession>(
+			`SELECT s.user_id, u.name, u.email, u.role,
+			        s.created_at, s.last_active_at, s.expires_at
+			   FROM sessions s
+			   JOIN users u ON u.id = s.user_id
+			  WHERE s.expires_at > NOW()
+			    AND s.last_active_at > NOW() - INTERVAL '6 hours'
+			  ORDER BY s.last_active_at DESC`,
+		);
+		const sessions: ActiveSession[] = [];
+		for await (const r of rows) sessions.push(r);
+		return { sessions };
+	},
+);
+
 // ─── Modified login: password check → OTP ────────────────────────────────────
 
 /**
