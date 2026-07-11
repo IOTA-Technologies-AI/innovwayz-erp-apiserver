@@ -798,7 +798,7 @@ export const triggerExpiryAlerts = api(
 );
 
 // Internal endpoint called by the daily cron
-const checkExpiryAlertsCron = api(
+export const checkExpiryAlertsCron = api(
 	{ expose: false, method: "POST", path: "/internal/contracts/alerts/cron" },
 	async (): Promise<void> => {
 		await runExpiryAlerts();
