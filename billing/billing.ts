@@ -142,7 +142,8 @@ export const createCustomer = api(
 			`INSERT INTO customers (name, short_name, billing_months_per_year, notes)
        VALUES ($1, $2, $3, $4)
        RETURNING id::text, name, short_name, billing_months_per_year, notes, created_at`,
-			req.name, req.short_name,
+			req.name,
+			req.short_name,
 			req.billing_months_per_year ?? 12,
 			req.notes ?? null,
 		);
@@ -193,7 +194,8 @@ export const deleteCustomer = api(
 			throw APIError.permissionDenied("Super Admin only");
 		// Prevent deletion if employees are assigned
 		const empCount = await db.rawQueryRow<{ count: number }>(
-			`SELECT COUNT(*)::int AS count FROM employees WHERE customer_id = $1`, req.id,
+			`SELECT COUNT(*)::int AS count FROM employees WHERE customer_id = $1`,
+			req.id,
 		);
 		if ((empCount?.count ?? 0) > 0)
 			throw APIError.failedPrecondition(
