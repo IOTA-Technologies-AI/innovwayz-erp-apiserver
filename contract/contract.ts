@@ -1,6 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
+import { CronJob } from "encore.dev/cron";
 import { user } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
@@ -55,6 +56,17 @@ export interface Contract {
 	renewed_by: string | null;
 	renewed_at: string | null;
 	renewed_contract_id: string | null;
+	// Enhanced fields
+	renewal_cycle: "monthly" | "quarterly" | "yearly";
+	contract_value: number | null;
+	benefit_type: "single" | "family";
+	gosi_amount: number;
+	family_benefit_amount: number;
+	single_benefit_amount: number;
+	annual_ticket_amount: number;
+	iqama_amount: number;
+	sales_manager_id: string | null;
+	sales_manager_name: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -93,6 +105,14 @@ const CONTRACT_COLS = `
 	activated_by, activated_at,
 	terminated_by, terminated_at, termination_reason,
 	renewed_by, renewed_at, renewed_contract_id,
+	renewal_cycle, contract_value::float8 AS contract_value,
+	benefit_type,
+	gosi_amount::float8 AS gosi_amount,
+	family_benefit_amount::float8 AS family_benefit_amount,
+	single_benefit_amount::float8 AS single_benefit_amount,
+	annual_ticket_amount::float8  AS annual_ticket_amount,
+	iqama_amount::float8          AS iqama_amount,
+	sales_manager_id, sales_manager_name,
 	created_at, updated_at
 `;
 
@@ -182,6 +202,17 @@ interface CreateContractInput {
 	notice_period_days?: number;
 	file_url?: string;
 	notes?: string;
+	// Enhanced fields
+	renewal_cycle?: "monthly" | "quarterly" | "yearly";
+	contract_value?: number;
+	benefit_type?: "single" | "family";
+	gosi_amount?: number;
+	family_benefit_amount?: number;
+	single_benefit_amount?: number;
+	annual_ticket_amount?: number;
+	iqama_amount?: number;
+	sales_manager_id?: string;
+	sales_manager_name?: string;
 }
 
 export const createContract = api(
@@ -207,7 +238,11 @@ export const createContract = api(
 				employee_id, employee_name, customer_id, customer_name, job_title,
 				contract_type, start_date, end_date, probation_end_date,
 				salary_amount, salary_currency, notice_period_days,
-				file_url, notes, status, created_by, created_by_name
+				file_url, notes, status, created_by, created_by_name,
+				renewal_cycle, contract_value, benefit_type,
+				gosi_amount, family_benefit_amount, single_benefit_amount,
+				annual_ticket_amount, iqama_amount,
+				sales_manager_id, sales_manager_name
 			) VALUES (
 				${id}, ${ref},
 				${input.employee_id ?? null}, ${input.employee_name},
@@ -221,7 +256,17 @@ export const createContract = api(
 				${input.salary_currency ?? "SAR"},
 				${input.notice_period_days ?? 30},
 				${input.file_url ?? null}, ${input.notes ?? null},
-				'draft', ${userID}, ${creatorName}
+				'draft', ${userID}, ${creatorName},
+				${input.renewal_cycle ?? "yearly"},
+				${input.contract_value ?? null},
+				${input.benefit_type ?? "single"},
+				${input.gosi_amount ?? 0},
+				${input.family_benefit_amount ?? 0},
+				${input.single_benefit_amount ?? 0},
+				${input.annual_ticket_amount ?? 0},
+				${input.iqama_amount ?? 0},
+				${input.sales_manager_id ?? null},
+				${input.sales_manager_name ?? null}
 			)
 		`;
 		await logEvent(id, "created", userID);
@@ -584,3 +629,185 @@ export const contractStats = api(
 		};
 	},
 );
+// ─── Contract Expiry Alert Cron (runs daily at 08:00) ─────────────────────────
+
+interface AlertContract {
+	id: string;
+	reference: string;
+	employee_name: string;
+	customer_name: string | null;
+	end_date: string;
+	renewal_cycle: string;
+	sales_manager_id: string | null;
+	sales_manager_name: string | null;
+	days_remaining: number;
+	alert_90_sent_at: string | null;
+	alert_60_sent_at: string | null;
+	alert_30_sent_at: string | null;
+	breach_notified_at: string | null;
+	last_daily_alert_at: string | null;
+}
+
+async function runExpiryAlerts(): Promise<void> {
+	log.info("running contract expiry alert check");
+
+	// Fetch active contracts with an end_date set
+	const rows = db.rawQuery<AlertContract>(
+		`SELECT
+       id, reference, employee_name, customer_name,
+       end_date::TEXT AS end_date, renewal_cycle,
+       sales_manager_id, sales_manager_name,
+       (end_date - CURRENT_DATE)::int AS days_remaining,
+       alert_90_sent_at, alert_60_sent_at, alert_30_sent_at,
+       breach_notified_at, last_daily_alert_at
+     FROM contracts
+     WHERE status = 'active' AND end_date IS NOT NULL
+     ORDER BY end_date ASC`,
+	);
+
+	for await (const c of rows) {
+		const days = c.days_remaining;
+
+		// Resolve recipients: sales manager + all admins
+		const recipients: string[] = [];
+		if (c.sales_manager_id) recipients.push(c.sales_manager_id);
+
+		// Also notify admin + super_admin roles
+		try {
+			const { users: admins } = await user.listByRoles({
+				roles: ["admin", "super_admin"],
+			});
+			for (const a of admins) {
+				if (!recipients.includes(a.id)) recipients.push(a.id);
+			}
+		} catch {
+			/* non-fatal */
+		}
+
+		if (recipients.length === 0) continue;
+
+		const subject90 = `⚠️ Contract Expiring in 90 Days — ${c.employee_name}`;
+		const subject60 = `🔔 Contract Expiring in 60 Days — ${c.employee_name}`;
+		const subject30 = `🚨 Contract Expiring in 30 Days — ${c.employee_name}`;
+		const subjectBreach = `🔴 CONTRACT BREACHED — ${c.employee_name} (Not Renewed)`;
+
+		const body = emailShell(
+			days <= 0
+				? "Contract Breached — Immediate Action Required"
+				: `Contract Expiring in ${days} Day(s)`,
+			erow("Employee", c.employee_name) +
+				erow("Client / Project", c.customer_name ?? "—") +
+				erow("Contract Ref", c.reference) +
+				erow("Renewal Cycle", c.renewal_cycle) +
+				erow("End Date", c.end_date) +
+				erow(
+					"Days Remaining",
+					days <= 0 ? `${Math.abs(days)} days overdue` : `${days} days`,
+				) +
+				(days <= 0
+					? erow(
+							"Status",
+							"🔴 LAPSED — contract not renewed, employee placement at risk",
+						)
+					: erow("Action Required", "Initiate renewal process immediately")),
+		);
+
+		// 90-day alert
+		if (days <= 90 && days > 60 && !c.alert_90_sent_at) {
+			for (const uid of recipients) {
+				await user
+					.sendNotification({ to: uid, subject: subject90, html: body })
+					.catch(() => {});
+			}
+			await db.exec`UPDATE contracts SET alert_90_sent_at = NOW() WHERE id = ${c.id}`;
+			log.info("90-day alert sent", { contract: c.id });
+		}
+
+		// 60-day alert
+		else if (days <= 60 && days > 30 && !c.alert_60_sent_at) {
+			for (const uid of recipients) {
+				await user
+					.sendNotification({ to: uid, subject: subject60, html: body })
+					.catch(() => {});
+			}
+			await db.exec`UPDATE contracts SET alert_60_sent_at = NOW() WHERE id = ${c.id}`;
+			log.info("60-day alert sent", { contract: c.id });
+		}
+
+		// 30-day alert
+		else if (days <= 30 && days > 0 && !c.alert_30_sent_at) {
+			for (const uid of recipients) {
+				await user
+					.sendNotification({ to: uid, subject: subject30, html: body })
+					.catch(() => {});
+			}
+			await db.exec`UPDATE contracts SET alert_30_sent_at = NOW() WHERE id = ${c.id}`;
+			log.info("30-day alert sent", { contract: c.id });
+		}
+
+		// Breach / lapsed — send once as breach notification, then daily
+		else if (days <= 0) {
+			const today = new Date().toISOString().slice(0, 10);
+			const lastDaily = c.last_daily_alert_at?.slice(0, 10);
+
+			// First-time breach notification
+			if (!c.breach_notified_at) {
+				for (const uid of recipients) {
+					await user
+						.sendNotification({ to: uid, subject: subjectBreach, html: body })
+						.catch(() => {});
+				}
+				await db.exec`
+          UPDATE contracts
+          SET breach_notified_at = NOW(), last_daily_alert_at = NOW()
+          WHERE id = ${c.id}
+        `;
+				// Mark status as expired
+				await db.exec`UPDATE contracts SET status = 'expired', updated_at = NOW() WHERE id = ${c.id}`;
+				log.warn("contract breached and expired", { contract: c.id });
+			}
+			// Daily reminder until renewed
+			else if (lastDaily !== today) {
+				for (const uid of recipients) {
+					await user
+						.sendNotification({
+							to: uid,
+							subject: `📋 Daily Reminder: ${subjectBreach}`,
+							html: body,
+						})
+						.catch(() => {});
+				}
+				await db.exec`UPDATE contracts SET last_daily_alert_at = NOW() WHERE id = ${c.id}`;
+				log.info("daily breach reminder sent", { contract: c.id });
+			}
+		}
+	}
+
+	log.info("contract expiry alert check complete");
+}
+
+// Exposed endpoint so Railway/external cron can also trigger manually
+export const triggerExpiryAlerts = api(
+	{ expose: true, auth: true, method: "POST", path: "/contracts/alerts/run" },
+	async (): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!isAdmin(role)) throw APIError.permissionDenied("admin only");
+		await runExpiryAlerts();
+		return { ok: true };
+	},
+);
+
+// Internal endpoint called by the daily cron
+const checkExpiryAlertsCron = api(
+	{ expose: false, method: "POST", path: "/internal/contracts/alerts/cron" },
+	async (): Promise<void> => {
+		await runExpiryAlerts();
+	},
+);
+
+// Daily cron — 08:00 UTC
+const _alertCron = new CronJob("contract-expiry-alerts", {
+	title: "Contract expiry alert emails (90/60/30 days + daily breach)",
+	schedule: "0 8 * * *",
+	endpoint: checkExpiryAlertsCron,
+});
