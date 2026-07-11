@@ -24,7 +24,7 @@ INSERT INTO chart_of_accounts (account_code, account_name, account_class) VALUES
 ('31200', 'Retained Earnings',                        'Equity'),
 ('32100', 'Ja Capital / Draws',                        'Equity'),
 ('32200', 'Wa Capital / Draws',                        'Equity'),
-('32300', 'Za Capital / Draws',                        'Equity'),
+('32300', 'ZA Capital / Draws',                        'Equity'),
 ('32400', 'Organization Growth Reserve',              'Equity'),
 -- [4xxxx] REVENUE
 ('41100', 'Bank Tier-1 Placement Fees',               'Revenue'),
@@ -41,10 +41,10 @@ INSERT INTO chart_of_accounts (account_code, account_name, account_class) VALUES
 -- ── Partner Capital Accounts ──────────────────────────────────────────────
 -- All three partners share 30% equally; 10% allocated to Organization Growth.
 -- Disbursement pool = Net Profit × 0.80 (20% stays as retained earnings [31200]).
--- Of the 80% pool: Ja 30%, Wa 30%, Za 30%, Org 10%.
+-- Of the 80% pool: Ja 30%, Wa 30%, ZA 30%, Org 10%.
 
 INSERT INTO partner_capital_accounts (id, partner_name, equity_percentage, associated_account, is_org_reserve) VALUES
-('partner-a',   'Ja (Managing)',               30.00, '32100', FALSE),
-('partner-b',   'Wa (Origination)',             30.00, '32200', FALSE),
-('partner-c',   'Za (Operations)',              30.00, '32300', FALSE),
-('partner-org', 'Organization Growth Reserve',  10.00, '32400', TRUE);
+('ja',  'Ja',                           30.00, '32100', FALSE),
+('wa',  'Wa',                           30.00, '32200', FALSE),
+('za',  'ZA',                           30.00, '32300', FALSE),
+('iwt', 'InnovWayz - Growth Reserve',   10.00, '32400', TRUE);

@@ -6,7 +6,7 @@
  * Bank Client & Resource Placement tracking, Trial Balance, P&L, Balance Sheet,
  * and automated Partner Disbursement calculations.
  *
- * Equity split (user-confirmed): Ja 30% / Wa 30% / Za 30% / Org Growth 10%
+ * Equity split (user-confirmed): Ja 30% / Wa 30% / ZA 30% / Org Growth 10%
  * Retained earnings: 20% of Net Profit locked to [31200] before distribution.
  */
 
