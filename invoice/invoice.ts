@@ -1,7 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
-import { user, billing } from "~encore/clients";
+import { user, billing, financial } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
 
@@ -635,6 +635,26 @@ export const payInvoice = api(
 			contact.name ?? null,
 			`Received ${SAR(increment)} (total paid ${SAR(newPaid)})`,
 		);
+
+		// ── Auto journal entry: Dr 11100 Cash / Cr 41100 Revenue ──────────────
+		void financial
+			.recordAutoEntry({
+				fiscal_period: paidDate.slice(0, 7),
+				reference_source: inv.reference,
+				description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
+				debit_account: "11100", // Corporate Operating Account (cash in)
+				credit_account: "41100", // Bank Tier-1 Placement Fees (revenue)
+				amount: increment,
+				actor_id: userID,
+				actor_name: contact.name ?? null,
+			})
+			.catch((e) =>
+				log.warn("auto financial entry failed for invoice", {
+					id: req.id,
+					error: String(e),
+				}),
+			);
+
 		return fetchInvoice(req.id);
 	},
 );

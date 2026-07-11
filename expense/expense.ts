@@ -1,7 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
-import { user } from "~encore/clients";
+import { user, financial } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
 
@@ -787,6 +787,24 @@ interface ProcessExpenseRequest {
 	paid_amount?: number;
 }
 
+/** Maps expense_class to the correct CoA account for auto journal entries. */
+function mapExpenseClassToAccount(expenseClass: string): string {
+	switch (expenseClass) {
+		case "employee":
+			return "51100"; // Contracted Resource Monthly Payroll
+		case "infrastructure":
+			return "52200"; // Enterprise Software Licenses & SaaS
+		case "management":
+			return "52100"; // Executive Staff Salaries
+		case "petty":
+			return "52100"; // Executive Staff Salaries (misc)
+		case "operational":
+			return "52300"; // Legal, Compliance & Audit Fees
+		default:
+			return "52300";
+	}
+}
+
 export const processExpense = api(
 	{ expose: true, auth: true, method: "POST", path: "/expenses/:id/process" },
 	async ({
@@ -840,6 +858,28 @@ export const processExpense = api(
 				payment_reference ?? undefined,
 			);
 			const updated = await fetchExpense(id);
+
+			// ── Auto journal entry: Dr [expense acct] / Cr 11100 Cash ──────────
+			const paidAmt = Number(paid_amount ?? e.amount);
+			const expAcct = mapExpenseClassToAccount(e.expense_class);
+			void financial
+				.recordAutoEntry({
+					fiscal_period: new Date().toISOString().slice(0, 7),
+					reference_source: e.reference,
+					description: `Expense paid — ${e.reference} — ${e.title}`,
+					debit_account: expAcct, // Expense account (cost recognised)
+					credit_account: "11100", // Corporate Operating Account (cash out)
+					amount: paidAmt,
+					actor_id: userID,
+					actor_name: actorName,
+				})
+				.catch((err: unknown) =>
+					log.warn("auto financial entry failed for expense", {
+						id,
+						error: String(err),
+					}),
+				);
+
 			void notifyUser(
 				updated.created_by,
 				`Your expense was paid — ${updated.reference}`,

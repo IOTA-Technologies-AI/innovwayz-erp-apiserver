@@ -1122,3 +1122,122 @@ export const getPnLTrend = api(
 		};
 	},
 );
+
+// ─── 13. Internal: Auto-record journal entry (called by invoice/expense services) ──
+
+/**
+ * Maps an expense_class value to the appropriate CoA expense account.
+ * Exported so external callers can use the same mapping logic.
+ */
+export function expenseClassToAccount(expenseClass: string): string {
+	switch (expenseClass) {
+		case "employee":
+			return "51100"; // Contracted Resource Monthly Payroll
+		case "infrastructure":
+			return "52200"; // Enterprise Software Licenses & SaaS
+		case "management":
+			return "52100"; // Executive Staff Salaries
+		case "petty":
+			return "52100"; // Executive Staff Salaries (misc)
+		case "operational":
+			return "52300"; // Legal, Compliance & Banking Audit Fees
+		default:
+			return "52300";
+	}
+}
+
+export interface AutoEntryRequest {
+	fiscal_period: string; // YYYY-MM
+	reference_source: string; // e.g. "INV-0042" or "EXP-0018"
+	description: string;
+	debit_account: string; // 5-digit CoA code
+	credit_account: string; // 5-digit CoA code
+	amount: number;
+	actor_id: string;
+	actor_name: string | null;
+}
+
+/**
+ * Internal endpoint — not exposed externally.
+ * Called by invoice and expense services when a payment is finalised.
+ * Creates a balanced, posted journal entry automatically.
+ */
+export const recordAutoEntry = api(
+	{ expose: false, method: "POST", path: "/financial/auto-entry" },
+	async (
+		req: AutoEntryRequest,
+	): Promise<{ ok: boolean; journal_entry_id: string }> => {
+		if (req.amount <= 0) {
+			log.warn("recordAutoEntry skipped: amount <= 0", {
+				source: req.reference_source,
+			});
+			return { ok: false, journal_entry_id: "" };
+		}
+
+		// Validate both accounts exist
+		const [drAcct, crAcct] = await Promise.all([
+			db.queryRow<{ account_code: string }>`
+        SELECT account_code FROM chart_of_accounts WHERE account_code = ${req.debit_account} AND is_active = TRUE
+      `,
+			db.queryRow<{ account_code: string }>`
+        SELECT account_code FROM chart_of_accounts WHERE account_code = ${req.credit_account} AND is_active = TRUE
+      `,
+		]);
+		if (!drAcct || !crAcct) {
+			log.warn("recordAutoEntry skipped: unknown account", {
+				debit: req.debit_account,
+				credit: req.credit_account,
+			});
+			return { ok: false, journal_entry_id: "" };
+		}
+
+		const id = crypto.randomUUID();
+		const seqRow = await db.rawQueryRow<{ nextval: string }>(
+			`SELECT nextval('financial_je_seq')`,
+		);
+		const reference = `JE-${req.fiscal_period}-${String(seqRow?.nextval ?? "AUTO").padStart(4, "0")}`;
+
+		await db.exec`
+      INSERT INTO journal_entries
+        (id, reference, fiscal_period, description,
+         is_posted, posted_at, posted_by, posted_by_name,
+         created_by, created_by_name, created_at, updated_at)
+      VALUES (
+        ${id}, ${reference}, ${req.fiscal_period}, ${req.description},
+        TRUE, NOW(), ${req.actor_id}, ${req.actor_name ?? null},
+        ${req.actor_id}, ${req.actor_name ?? null}, NOW(), NOW()
+      )
+    `;
+
+		await db.exec`
+      INSERT INTO ledger_lines (id, journal_entry_id, account_code, debit, credit, description)
+      VALUES (${crypto.randomUUID()}, ${id}, ${req.debit_account},  ${req.amount}, 0.00, ${req.reference_source})
+    `;
+		await db.exec`
+      INSERT INTO ledger_lines (id, journal_entry_id, account_code, debit, credit, description)
+      VALUES (${crypto.randomUUID()}, ${id}, ${req.credit_account}, 0.00, ${req.amount}, ${req.reference_source})
+    `;
+
+		await audit(
+			"journal_entries",
+			id,
+			"auto_created",
+			req.actor_id,
+			req.actor_name,
+			{
+				source: req.reference_source,
+				debit_account: req.debit_account,
+				credit_account: req.credit_account,
+				amount: req.amount,
+			},
+		);
+
+		log.info("auto journal entry created", {
+			id,
+			reference,
+			source: req.reference_source,
+			amount: req.amount,
+		});
+		return { ok: true, journal_entry_id: id };
+	},
+);
