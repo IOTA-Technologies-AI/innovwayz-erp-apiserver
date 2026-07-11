@@ -936,15 +936,41 @@ export const getBalanceSheet = api(
 
 		const totalAssets = assets.reduce((s, a) => s + a.balance, 0);
 		const totalLiabilities = liabilities.reduce((s, a) => s + a.balance, 0);
-		const totalEquity = equity.reduce((s, a) => s + a.balance, 0);
-		const totalLE = totalLiabilities + totalEquity;
+		let totalEquity = equity.reduce((s, a) => s + a.balance, 0);
+
+		// ── Roll current-period net income into equity ─────────────────────────
+		// Revenue & Expense accounts are not on the balance sheet directly.
+		// Until a closing entry is posted, we compute net income inline and
+		// surface it as a virtual equity row so Assets = L + E always holds.
+		const niRow = await db.rawQueryRow<{ net_income: number }>(
+			`SELECT COALESCE(
+         SUM(CASE WHEN coa.account_class = 'Revenue' THEN ll.credit - ll.debit  ELSE 0 END) -
+         SUM(CASE WHEN coa.account_class = 'Expense' THEN ll.debit  - ll.credit ELSE 0 END),
+         0
+       ) AS net_income
+       FROM chart_of_accounts coa
+       JOIN ledger_lines ll  ON coa.account_code = ll.account_code
+       JOIN journal_entries je ON ll.journal_entry_id = je.id AND je.is_posted = TRUE
+       WHERE coa.account_class IN ('Revenue', 'Expense')`,
+		);
+		const netIncome = Math.round(Number(niRow?.net_income ?? 0) * 100) / 100;
+		if (Math.abs(netIncome) > 0.005) {
+			equity.push({
+				account_code: "NET",
+				account_name: "Current Period Net Income (P&L roll-up)",
+				balance: netIncome,
+			});
+			totalEquity = Math.round((totalEquity + netIncome) * 100) / 100;
+		}
+
+		const totalLE = Math.round((totalLiabilities + totalEquity) * 100) / 100;
 
 		return {
 			as_of_period: req.fiscal_period ?? "all-time",
 			assets,
 			liabilities,
 			equity,
-			total_assets: totalAssets,
+			total_assets: Math.round(totalAssets * 100) / 100,
 			total_liabilities: totalLiabilities,
 			total_equity: totalEquity,
 			total_liabilities_and_equity: totalLE,
