@@ -594,7 +594,7 @@ async function sendEmail(
 interface InviteRequest {
 	email: string;
 	name: string;
-	role?: "super_admin" | "admin" | "manager" | "finance" | "user";
+	role?: "super_admin" | "admin" | "manager" | "finance" | "user" | "bdm";
 }
 
 /**
