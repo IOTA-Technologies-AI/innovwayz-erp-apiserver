@@ -407,7 +407,8 @@ export const sendLockOtp = api(
 		if (!user) throw APIError.notFound("user not found");
 
 		// Generate 6-digit OTP (10-minute expiry)
-		const code = String(Math.floor(100000 + Math.random() * 900000));
+		// crypto-secure: OTPs must not come from a predictable PRNG
+		const code = String(crypto.randomInt(100000, 1000000));
 		const otpId = crypto.randomUUID();
 		const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
 
@@ -421,7 +422,9 @@ export const sendLockOtp = api(
 
 		await sendEmail(
 			user.email,
-			"InnovWayz ERP — session verification code",
+			// Code leads the subject so it can be read/copied straight from the
+			// notification banner without opening the email.
+			`${code} — your InnovWayz ERP session verification code`,
 			`<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
@@ -993,7 +996,8 @@ export const loginWithOtp = api(
 			);
 
 		// Generate 6-digit OTP
-		const code = String(Math.floor(100000 + Math.random() * 900000));
+		// crypto-secure: OTPs must not come from a predictable PRNG
+		const code = String(crypto.randomInt(100000, 1000000));
 		const otpId = crypto.randomUUID();
 		const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
 
@@ -1010,7 +1014,9 @@ export const loginWithOtp = api(
 
 		await sendEmail(
 			email,
-			"Your InnovWayz ERP verification code",
+			// Code leads the subject so it can be read/copied straight from the
+			// notification banner without opening the email.
+			`${code} is your InnovWayz ERP verification code`,
 			`<!DOCTYPE html>
 <html lang="en">
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"></head>
