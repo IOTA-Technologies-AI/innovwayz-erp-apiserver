@@ -218,13 +218,41 @@ async function generateLetterForRequest(
 	actorId: string,
 	actorName: string | null,
 ): Promise<string> {
-	if (!req.employee_id) {
-		throw new Error(
-			"request is not linked to an employee record — edit the request and select the employee from the list",
+	// Requests submitted by regular employees carry a free-text name with no
+	// employee_id. Resolve it against the roster by exact (case-insensitive)
+	// name match and backfill the link so future actions are direct.
+	let employeeId = req.employee_id;
+	if (!employeeId) {
+		const { employees } = await billing.listEmployees();
+		const target = req.employee_name.trim().toLowerCase();
+		const matches = employees.filter(
+			(e) => e.name.trim().toLowerCase() === target,
+		);
+		if (matches.length !== 1) {
+			throw new Error(
+				matches.length === 0
+					? `no employee record matches "${req.employee_name}" — edit the request and select the employee from the list`
+					: `multiple employee records match "${req.employee_name}" — edit the request and select the exact employee from the list`,
+			);
+		}
+		employeeId = matches[0].id;
+		await db.exec`
+			UPDATE employee_requests SET
+				employee_id   = ${employeeId},
+				customer_id   = COALESCE(customer_id, ${matches[0].customer_id}),
+				customer_name = COALESCE(customer_name, ${matches[0].customer_name}),
+				updated_at    = NOW()
+			WHERE id = ${req.id}
+		`;
+		await logEvent(
+			req.id,
+			"employee_linked",
+			actorId,
+			`matched by name to ${matches[0].name}`,
 		);
 	}
 
-	const emp = await billing.getEmployeeCompensation({ id: req.employee_id });
+	const emp = await billing.getEmployeeCompensation({ id: employeeId });
 
 	// Employment dates + formal job title from the contract service (optional).
 	let dateOfJoining: string | null = null;
@@ -232,7 +260,7 @@ async function generateLetterForRequest(
 	let jobTitle: string | null = null;
 	try {
 		const { contracts } = await contract.listContracts({
-			employee_id: req.employee_id,
+			employee_id: employeeId,
 			limit: 100,
 		});
 		const employment = contracts
@@ -490,6 +518,12 @@ interface UpdateRequestInput {
 	required_by_date?: string | null;
 	attachment_url?: string | null;
 	request_subtype?: string | null;
+	// Employee / customer link — lets HR link a free-text request to the
+	// roster record so letters can be generated against system data
+	employee_id?: string | null;
+	employee_name?: string;
+	customer_id?: string | null;
+	customer_name?: string | null;
 	// HR internal notes (manager/admin only)
 	notes?: string | null;
 }
@@ -524,6 +558,10 @@ export const updateRequest = api(
 				required_by_date = CASE WHEN ${input.required_by_date !== undefined} THEN ${input.required_by_date ?? null} ELSE required_by_date END,
 				attachment_url   = CASE WHEN ${input.attachment_url !== undefined} THEN ${input.attachment_url ?? null} ELSE attachment_url END,
 				request_subtype  = CASE WHEN ${input.request_subtype !== undefined} THEN ${input.request_subtype ?? null} ELSE request_subtype END,
+				employee_id      = CASE WHEN ${input.employee_id !== undefined} THEN ${input.employee_id ?? null} ELSE employee_id END,
+				employee_name    = COALESCE(${input.employee_name ?? null}, employee_name),
+				customer_id      = CASE WHEN ${input.customer_id !== undefined} THEN ${input.customer_id ?? null} ELSE customer_id END,
+				customer_name    = CASE WHEN ${input.customer_name !== undefined} THEN ${input.customer_name ?? null} ELSE customer_name END,
 				notes            = CASE WHEN ${input.notes !== undefined} THEN ${input.notes ?? null} ELSE notes END,
 				updated_at       = NOW()
 			WHERE id = ${input.id}
