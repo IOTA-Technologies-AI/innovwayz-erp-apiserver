@@ -1,7 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
-import { user, billing, contract } from "~encore/clients";
+import { user, billing, contract, payroll, leave } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
 import {
@@ -307,6 +307,56 @@ async function generateLetterForRequest(
 				"no salary on record for this employee — set the monthly salary before generating a salary certificate",
 			);
 		}
+
+		// Current-period overtime/additions and salary advance/deductions from
+		// the latest payroll record (list is sorted latest period first).
+		let overtime = 0;
+		let salaryAdvance = 0;
+		try {
+			const { salaries } = await payroll.listSalaryPayments({
+				employee_id: employeeId,
+			});
+			const latest = salaries.find(
+				(s) => !["rejected", "cancelled"].includes(s.status),
+			);
+			if (latest) {
+				overtime = Number(latest.additions) || 0;
+				salaryAdvance = Number(latest.deductions) || 0;
+			}
+		} catch (err) {
+			log.warn("letter generation: payroll lookup failed", {
+				request_id: req.id,
+				error: String(err),
+			});
+		}
+
+		// Loss of pay: leave days used beyond the allowed quota this year
+		// (entitled + carry-forward), across all leave types. Unpaid leave
+		// typically carries no entitlement, so it counts in full.
+		let lossOfPayDays = 0;
+		try {
+			const { balances } = await leave.listLeaveBalances({
+				employee_id: employeeId,
+				year: new Date().getFullYear(),
+			});
+			for (const bal of balances) {
+				const allowed =
+					(Number(bal.entitled_days) || 0) +
+					(Number(bal.carry_forward_days) || 0);
+				const used = Number(bal.used_days) || 0;
+				if (used > allowed) lossOfPayDays += used - allowed;
+			}
+		} catch (err) {
+			log.warn("letter generation: leave balance lookup failed", {
+				request_id: req.id,
+				error: String(err),
+			});
+		}
+		lossOfPayDays = Math.round(lossOfPayDays * 100) / 100;
+		// KSA convention: daily rate = monthly gross / 30
+		const lossOfPay =
+			Math.round(((emp.monthly_salary / 30) * lossOfPayDays) * 100) / 100;
+
 		const data: SalaryCertificateData = {
 			...base,
 			currency: "SAR",
@@ -317,6 +367,10 @@ async function generateLetterForRequest(
 				transport: emp.transport_allowance,
 				other: emp.other_allowance,
 			},
+			overtime,
+			lossOfPayDays,
+			lossOfPay,
+			salaryAdvance,
 		};
 		pdf = await generateSalaryCertificate(data);
 		label = "Salary_Certificate";

@@ -63,6 +63,7 @@ export interface LetterData {
 
 export interface SalaryCertificateData extends LetterData {
 	currency: string;
+	/** Gross monthly salary (excluding overtime/additions). */
 	monthlySalary: number;
 	breakdown?: {
 		basic: number | null;
@@ -70,6 +71,14 @@ export interface SalaryCertificateData extends LetterData {
 		transport: number | null;
 		other: number | null;
 	} | null;
+	/** Current-period overtime / other additions (from payroll). */
+	overtime?: number;
+	/** Excess leave days beyond the allowed quota (from leave balances). */
+	lossOfPayDays?: number;
+	/** Loss-of-pay amount = daily rate × excess days. */
+	lossOfPay?: number;
+	/** Current-period salary advance / other deductions (from payroll). */
+	salaryAdvance?: number;
 }
 
 // ─── Formatting helpers ──────────────────────────────────────────────────────
@@ -398,72 +407,124 @@ export function generateExperienceLetter(data: LetterData): Promise<Buffer> {
 		);
 
 		y = drawParagraphs(doc, paragraphs, y);
-		drawSignature(doc, Math.min(y + 12, 620));
+		// Anchor the signature after the content, but never so low that the
+		// ~80pt block collides with the fixed footer at PAGE.footerTop.
+		drawSignature(doc, Math.min(y + 12, PAGE.footerTop - 90));
 		drawFooter(doc, data.reference);
 	});
 }
 
 // ─── Salary Certificate ──────────────────────────────────────────────────────
 
-/** Payslip-style salary table. Returns the y below the table. */
+/**
+ * Payslip-style two-column table: accruals (earnings) on the left,
+ * deductions on the right, followed by a full-width NET PAY band.
+ * Zero/absent components render with an em dash, mirroring the payslip.
+ * Returns the y below the block.
+ */
 function drawSalaryTable(doc: PDFKit.PDFDocument, data: SalaryCertificateData, y: number): number {
-	const rowH = 22;
-	const amountW = 150;
-	const labelX = PAGE.marginX + 14;
-	const amountX = PAGE.width - PAGE.marginX - amountW;
+	const rowH = 20;
+	const bandH = 22;
+	const gap = 14;
+	const leftW = 280;
+	const rightW = CONTENT_W - leftW - gap;
+	const leftX = PAGE.marginX;
+	const rightX = PAGE.marginX + leftW + gap;
 
-	const components: Array<[string, number]> = [];
+	const overtime = data.overtime ?? 0;
+	const lossOfPay = data.lossOfPay ?? 0;
+	const salaryAdvance = data.salaryAdvance ?? 0;
+	const gross = data.monthlySalary + overtime;
+	const totalDeductions = lossOfPay + salaryAdvance;
+	const net = gross - totalDeductions;
+
 	const b = data.breakdown;
-	if (b && (b.basic || b.housing || b.transport || b.other)) {
-		if (b.basic) components.push(["Basic Pay", b.basic]);
-		if (b.housing) components.push(["House Rent Allowance", b.housing]);
-		if (b.transport) components.push(["Travel & Other Allowance", b.transport]);
-		if (b.other) components.push(["Other Allowance", b.other]);
-	} else {
-		components.push(["Monthly Salary (Consolidated)", data.monthlySalary]);
-	}
+	const hasBreakdown = Boolean(b && (b.basic || b.housing || b.transport || b.other));
+	const accruals: Array<[string, number]> = hasBreakdown
+		? [
+				["Basic Salary", b!.basic ?? 0],
+				["House Rent Allowance", b!.housing ?? 0],
+				["Transportation Allowance", b!.transport ?? 0],
+				["Other Allowance", b!.other ?? 0],
+				["Overtime", overtime],
+			]
+		: [
+				["Monthly Salary (Consolidated)", data.monthlySalary],
+				["Overtime", overtime],
+			];
 
-	// Header band
-	doc.rect(PAGE.marginX, y, CONTENT_W, rowH).fill(BRAND.blue);
+	const lopLabel = data.lossOfPayDays
+		? `Loss of Pay (${data.lossOfPayDays} day${data.lossOfPayDays === 1 ? "" : "s"})`
+		: "Loss of Pay";
+	const deductions: Array<[string, number]> = [
+		[lopLabel, lossOfPay],
+		["Salary Advance", salaryAdvance],
+	];
+
+	const drawColumn = (
+		x: number,
+		w: number,
+		title: string,
+		rows: Array<[string, number]>,
+		totalLabel: string,
+		total: number,
+	): number => {
+		// Header band
+		doc.rect(x, y, w, bandH).fill(BRAND.blue);
+		doc
+			.font("Helvetica-Bold")
+			.fontSize(9)
+			.fillColor("#FFFFFF")
+			.text(title, x + 10, y + 6.5, { characterSpacing: 0.6 })
+			.text(`AMOUNT (${data.currency})`, x, y + 6.5, { width: w - 10, align: "right" });
+		let cy = y + bandH;
+
+		for (const [label, amount] of rows) {
+			doc
+				.font("Helvetica")
+				.fontSize(9.5)
+				.fillColor(BRAND.ink)
+				// lineBreak off: labels are sized to fit; wrapping would collide
+				// with the following row in this fixed-height layout
+				.text(label, x + 10, cy + 6, { width: w - 80, lineBreak: false })
+				.text(amount > 0 ? fmtMoney(amount) : "—", x, cy + 6, {
+					width: w - 10,
+					align: "right",
+				});
+			cy += rowH;
+			doc.moveTo(x, cy).lineTo(x + w, cy).lineWidth(0.7).stroke(BRAND.line);
+		}
+
+		// Total band
+		doc.rect(x, cy, w, bandH).fill(BRAND.navy);
+		doc
+			.font("Helvetica-Bold")
+			.fontSize(9)
+			.fillColor("#FFFFFF")
+			.text(totalLabel, x + 10, cy + 6.5, { characterSpacing: 0.4 })
+			.text(total > 0 ? fmtMoney(total) : "—", x, cy + 6.5, {
+				width: w - 10,
+				align: "right",
+			});
+		return cy + bandH;
+	};
+
+	const leftBottom = drawColumn(leftX, leftW, "ACCRUALS", accruals, "GROSS PAY", gross);
+	const rightBottom = drawColumn(rightX, rightW, "DEDUCTIONS", deductions, "TOTAL DEDUCTIONS", totalDeductions);
+
+	// NET PAY band, full width
+	const netY = Math.max(leftBottom, rightBottom) + 10;
+	doc.rect(PAGE.marginX, netY, CONTENT_W, bandH + 2).fill(BRAND.blue);
 	doc
 		.font("Helvetica-Bold")
-		.fontSize(9.5)
+		.fontSize(10.5)
 		.fillColor("#FFFFFF")
-		.text("MONTHLY SALARY COMPONENTS", labelX, y + 6.5, { characterSpacing: 0.6 })
-		.text(`AMOUNT (${data.currency})`, amountX, y + 6.5, {
-			width: amountW - 14,
+		.text("NET PAY", PAGE.marginX + 10, netY + 7, { characterSpacing: 0.8 })
+		.text(`${data.currency} ${fmtMoney(net)}`, PAGE.marginX, netY + 7, {
+			width: CONTENT_W - 10,
 			align: "right",
 		});
-	let cy = y + rowH;
-
-	// Component rows
-	for (const [label, amount] of components) {
-		doc
-			.font("Helvetica")
-			.fontSize(10)
-			.fillColor(BRAND.ink)
-			.text(label, labelX, cy + 6.5)
-			.text(fmtMoney(amount), amountX, cy + 6.5, { width: amountW - 14, align: "right" });
-		cy += rowH;
-		doc
-			.moveTo(PAGE.marginX, cy)
-			.lineTo(PAGE.width - PAGE.marginX, cy)
-			.lineWidth(0.7)
-			.stroke(BRAND.line);
-	}
-
-	// Gross band
-	doc.rect(PAGE.marginX, cy, CONTENT_W, rowH).fill(BRAND.navy);
-	doc
-		.font("Helvetica-Bold")
-		.fontSize(10)
-		.fillColor("#FFFFFF")
-		.text("GROSS MONTHLY SALARY", labelX, cy + 6, { characterSpacing: 0.6 })
-		.text(`${data.currency} ${fmtMoney(data.monthlySalary)}`, amountX, cy + 6, {
-			width: amountW - 14,
-			align: "right",
-		});
-	return cy + rowH + 14;
+	return netY + bandH + 16;
 }
 
 export function generateSalaryCertificate(data: SalaryCertificateData): Promise<Buffer> {
@@ -485,21 +546,26 @@ export function generateSalaryCertificate(data: SalaryCertificateData): Promise<
 					`${data.employeeCode ? ` (Employee ID: ${data.employeeCode})` : ""} is a full-time ` +
 					`employee of ${COMPANY.name}` +
 					`${data.dateOfJoining ? `, employed since ${fmtShortDate(data.dateOfJoining)},` : ""} ` +
-					`currently holding the position of ${data.designation}. The current monthly salary ` +
-					`details of the employee are as follows:`,
+					`currently holding the position of ${data.designation}. The salary accruals and ` +
+					`deductions of the employee for the current period are as follows:`,
 			],
 			y,
 		);
 
 		y = drawSalaryTable(doc, data, y);
 
-		// Amount in words
+		// Net amount in words
+		const net =
+			data.monthlySalary +
+			(data.overtime ?? 0) -
+			(data.lossOfPay ?? 0) -
+			(data.salaryAdvance ?? 0);
 		doc
 			.font("Helvetica-Oblique")
 			.fontSize(9.5)
 			.fillColor(BRAND.gray)
 			.text(
-				`Say: Saudi Riyals ${numberToWords(Math.round(data.monthlySalary))} Only, per month.`,
+				`Say: Saudi Riyals ${numberToWords(Math.round(net))} Only, net per month.`,
 				PAGE.marginX,
 				y,
 				{ width: CONTENT_W },
@@ -516,7 +582,9 @@ export function generateSalaryCertificate(data: SalaryCertificateData): Promise<
 			y,
 		);
 
-		drawSignature(doc, Math.min(y + 12, 620));
+		// Anchor the signature after the content, but never so low that the
+		// ~80pt block collides with the fixed footer at PAGE.footerTop.
+		drawSignature(doc, Math.min(y + 12, PAGE.footerTop - 90));
 		drawFooter(doc, data.reference);
 	});
 }
