@@ -6,8 +6,8 @@
 -- =============================================================
 
 CREATE TABLE request_documents (
-  id                UUID PRIMARY KEY,
-  request_id        UUID NOT NULL REFERENCES employee_requests(id) ON DELETE CASCADE,
+  id                TEXT PRIMARY KEY,
+  request_id        TEXT NOT NULL REFERENCES employee_requests(id) ON DELETE CASCADE,
   document_type     TEXT NOT NULL,          -- request_type at generation time
   file_name         TEXT NOT NULL,
   content_type      TEXT NOT NULL DEFAULT 'application/pdf',
