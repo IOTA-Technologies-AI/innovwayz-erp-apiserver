@@ -1,9 +1,14 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
-import { user } from "~encore/clients";
+import { user, billing, contract } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
+import {
+	generateExperienceLetter,
+	generateSalaryCertificate,
+	type SalaryCertificateData,
+} from "./letters";
 
 const db = new SQLDatabase("request", {
 	migrations: "./migrations",
@@ -62,6 +67,8 @@ export interface EmployeeRequest {
 	rejection_reason: string | null;
 	created_at: string;
 	updated_at: string;
+	/** True when a generated letter/certificate is available for download. */
+	document_available: boolean;
 }
 
 export interface RequestEvent {
@@ -93,7 +100,10 @@ const REQUEST_COLS = `
 	attachment_url, notes, status, created_by, created_by_name,
 	reviewed_by, reviewed_at, completed_by, completed_at, completion_notes,
 	rejected_by, rejected_at, rejection_reason,
-	created_at, updated_at
+	created_at, updated_at,
+	EXISTS(
+		SELECT 1 FROM request_documents d WHERE d.request_id = employee_requests.id
+	) AS document_available
 `;
 
 async function fetchRequest(id: string): Promise<EmployeeRequest> {
@@ -185,6 +195,121 @@ const REQUEST_TYPE_LABELS: Record<RequestType, string> = {
 	noc_letter: "NOC Letter",
 	other: "Other",
 };
+
+// ─── Letter generation ────────────────────────────────────────────────────────
+
+/** Request types that produce an auto-generated PDF letter on completion. */
+const LETTER_REQUEST_TYPES: RequestType[] = [
+	"experience_letter",
+	"salary_certificate",
+];
+
+function slugify(name: string): string {
+	return name.trim().replace(/[^A-Za-z0-9]+/g, "_").replace(/^_|_$/g, "");
+}
+
+/**
+ * Assemble employee data from the billing (roster + salary) and contract
+ * (employment dates) services, render the PDF and store it against the
+ * request. Regeneration inserts a new version; the latest one is served.
+ */
+async function generateLetterForRequest(
+	req: EmployeeRequest,
+	actorId: string,
+	actorName: string | null,
+): Promise<string> {
+	if (!req.employee_id) {
+		throw new Error(
+			"request is not linked to an employee record — edit the request and select the employee from the list",
+		);
+	}
+
+	const emp = await billing.getEmployeeCompensation({ id: req.employee_id });
+
+	// Employment dates + formal job title from the contract service (optional).
+	let dateOfJoining: string | null = null;
+	let dateOfRelieving: string | null = null;
+	let jobTitle: string | null = null;
+	try {
+		const { contracts } = await contract.listContracts({
+			employee_id: req.employee_id,
+			limit: 100,
+		});
+		const employment = contracts
+			.filter((c) => c.status !== "draft")
+			.sort((a, b) => b.start_date.localeCompare(a.start_date));
+		if (employment.length > 0) {
+			const latest = employment[0];
+			// Joining date = earliest contract start across the employment chain
+			dateOfJoining = employment[employment.length - 1].start_date;
+			jobTitle = latest.job_title;
+			if (["terminated", "expired"].includes(latest.status)) {
+				dateOfRelieving =
+					latest.end_date ?? latest.terminated_at?.slice(0, 10) ?? null;
+			}
+		}
+	} catch (err) {
+		log.warn("letter generation: contract lookup failed", {
+			request_id: req.id,
+			error: String(err),
+		});
+	}
+
+	const employeeCode =
+		emp.serial_no != null
+			? `INW-${String(emp.serial_no).padStart(4, "0")}`
+			: null;
+
+	const base = {
+		reference: req.reference,
+		employeeName: req.employee_name,
+		employeeCode,
+		designation: jobTitle ?? emp.position,
+		clientName: emp.customer_name,
+		dateOfJoining,
+		dateOfRelieving,
+		purpose: req.request_subtype || null,
+	};
+
+	let pdf: Buffer;
+	let label: string;
+	if (req.request_type === "salary_certificate") {
+		if (!emp.monthly_salary || emp.monthly_salary <= 0) {
+			throw new Error(
+				"no salary on record for this employee — set the monthly salary before generating a salary certificate",
+			);
+		}
+		const data: SalaryCertificateData = {
+			...base,
+			currency: "SAR",
+			monthlySalary: emp.monthly_salary,
+			breakdown: {
+				basic: emp.basic_amount,
+				housing: emp.housing_allowance,
+				transport: emp.transport_allowance,
+				other: emp.other_allowance,
+			},
+		};
+		pdf = await generateSalaryCertificate(data);
+		label = "Salary_Certificate";
+	} else {
+		pdf = await generateExperienceLetter(base);
+		label = "Experience_Letter";
+	}
+
+	const fileName = `${label}-${slugify(req.employee_name)}-${req.reference}.pdf`;
+	await db.exec`
+		INSERT INTO request_documents (
+			id, request_id, document_type, file_name, content_type,
+			data_base64, generated_by, generated_by_name
+		) VALUES (
+			${crypto.randomUUID()}, ${req.id}, ${req.request_type}, ${fileName},
+			'application/pdf', ${pdf.toString("base64")}, ${actorId}, ${actorName}
+		)
+	`;
+	await logEvent(req.id, "letter_generated", actorId, fileName);
+	return fileName;
+}
 
 // ─── Create ───────────────────────────────────────────────────────────────────
 
@@ -482,6 +607,30 @@ export const completeRequest = api(
 		`;
 		await logEvent(input.id, "completed", userID, input.completion_notes);
 
+		// Auto-generate the letter for letter-type requests. A failure here must
+		// not roll back the completion — it is logged on the audit trail and the
+		// letter can be retried via POST /requests/:id/generate-letter.
+		let letterGenerated = false;
+		if (LETTER_REQUEST_TYPES.includes(req.request_type)) {
+			try {
+				let actorName: string | null = null;
+				try {
+					actorName = (await user.getContact({ id: userID })).name;
+				} catch {
+					// non-fatal
+				}
+				await generateLetterForRequest(req, userID, actorName);
+				letterGenerated = true;
+			} catch (err) {
+				const msg = err instanceof Error ? err.message : String(err);
+				log.error("letter generation failed", {
+					request_id: input.id,
+					error: msg,
+				});
+				await logEvent(input.id, "letter_generation_failed", userID, msg);
+			}
+		}
+
 		// Notify creator
 		const typeLabel = REQUEST_TYPE_LABELS[req.request_type] ?? req.request_type;
 		const html = emailShell(
@@ -489,6 +638,9 @@ export const completeRequest = api(
 			row("Reference", req.reference) +
 				row("Type", typeLabel) +
 				row("Status", "Completed") +
+				(letterGenerated
+					? row("Document", "Your letter is ready — download it from the Employee Requests page in the ERP portal")
+					: "") +
 				(input.completion_notes ? row("Notes", input.completion_notes) : ""),
 		);
 		notifyUser(
@@ -498,6 +650,108 @@ export const completeRequest = api(
 		);
 
 		return { request: await fetchRequest(input.id) };
+	},
+);
+
+// ─── Generate / regenerate letter (manager) ──────────────────────────────────
+
+interface GenerateLetterResponse {
+	request: EmployeeRequest;
+	file_name: string;
+}
+
+export const generateRequestLetter = api(
+	{ expose: true, method: "POST", path: "/requests/:id/generate-letter", auth: true },
+	async ({ id }: { id: string }): Promise<GenerateLetterResponse> => {
+		const { userID, role } = getAuthData()!;
+		if (!isManager(role)) {
+			throw APIError.permissionDenied("managers only");
+		}
+		const req = await fetchRequest(id);
+		if (!LETTER_REQUEST_TYPES.includes(req.request_type)) {
+			throw APIError.invalidArgument(
+				"letters can only be generated for experience letter and salary certificate requests",
+			);
+		}
+		if (["rejected", "cancelled"].includes(req.status)) {
+			throw APIError.failedPrecondition(
+				`cannot generate a letter for a ${req.status} request`,
+			);
+		}
+
+		let actorName: string | null = null;
+		try {
+			actorName = (await user.getContact({ id: userID })).name;
+		} catch {
+			// non-fatal
+		}
+
+		try {
+			const fileName = await generateLetterForRequest(req, userID, actorName);
+			return { request: await fetchRequest(id), file_name: fileName };
+		} catch (err) {
+			const msg = err instanceof Error ? err.message : String(err);
+			await logEvent(id, "letter_generation_failed", userID, msg);
+			throw APIError.failedPrecondition(msg);
+		}
+	},
+);
+
+// ─── Download generated letter ───────────────────────────────────────────────
+
+export const downloadRequestDocument = api.raw(
+	{ expose: true, auth: true, method: "GET", path: "/requests/:id/document" },
+	async (req, resp) => {
+		const { userID, role } = getAuthData()!;
+
+		const match = (req.url ?? "").match(/\/requests\/([^/]+)\/document/);
+		const id = match?.[1];
+		if (!id) {
+			resp.writeHead(400, { "Content-Type": "application/json" });
+			resp.end(JSON.stringify({ message: "invalid request id" }));
+			return;
+		}
+
+		const request = await db.rawQueryRow<{ created_by: string }>(
+			`SELECT created_by FROM employee_requests WHERE id = $1`,
+			id,
+		);
+		if (!request) {
+			resp.writeHead(404, { "Content-Type": "application/json" });
+			resp.end(JSON.stringify({ message: "request not found" }));
+			return;
+		}
+		if (!isManager(role) && request.created_by !== userID) {
+			resp.writeHead(403, { "Content-Type": "application/json" });
+			resp.end(JSON.stringify({ message: "access denied" }));
+			return;
+		}
+
+		const doc = await db.rawQueryRow<{
+			file_name: string;
+			content_type: string;
+			data_base64: string;
+		}>(
+			`SELECT file_name, content_type, data_base64
+             FROM request_documents
+             WHERE request_id = $1
+             ORDER BY created_at DESC
+             LIMIT 1`,
+			id,
+		);
+		if (!doc) {
+			resp.writeHead(404, { "Content-Type": "application/json" });
+			resp.end(JSON.stringify({ message: "no document has been generated for this request" }));
+			return;
+		}
+
+		const buf = Buffer.from(doc.data_base64, "base64");
+		resp.writeHead(200, {
+			"Content-Type": doc.content_type,
+			"Content-Disposition": `attachment; filename="${doc.file_name}"`,
+			"Content-Length": buf.length,
+		});
+		resp.end(buf);
 	},
 );
 

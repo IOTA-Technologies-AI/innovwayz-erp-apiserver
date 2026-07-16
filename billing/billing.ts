@@ -223,6 +223,11 @@ interface EmployeeWithDetails {
 	monthly_billing: number;
 	annual_billing: number;
 	billing_year: number;
+	// Optional salary component breakdown (payslip structure)
+	basic_amount: number | null;
+	housing_allowance: number | null;
+	transport_allowance: number | null;
+	other_allowance: number | null;
 }
 
 interface ListEmployeesResponse {
@@ -245,7 +250,11 @@ export const listEmployees = api(
         COALESCE(s.monthly_amount, 0)::float8                         AS monthly_salary,
         COALESCE(br.monthly_rate, 0)::float8                          AS monthly_billing,
         COALESCE(br.annual_amount, 0)::float8                         AS annual_billing,
-        COALESCE(br.billing_year, ${year})                           AS billing_year
+        COALESCE(br.billing_year, ${year})                           AS billing_year,
+        s.basic_amount::float8                                        AS basic_amount,
+        s.housing_allowance::float8                                   AS housing_allowance,
+        s.transport_allowance::float8                                 AS transport_allowance,
+        s.other_allowance::float8                                     AS other_allowance
       FROM employees e
       JOIN customers c ON e.customer_id = c.id
       LEFT JOIN salaries s
@@ -268,6 +277,11 @@ interface CreateEmployeeRequest {
 	billing_months_override?: number;
 	monthly_salary: number;
 	monthly_billing: number;
+	// Optional salary component breakdown (should sum to monthly_salary)
+	basic_amount?: number;
+	housing_allowance?: number;
+	transport_allowance?: number;
+	other_allowance?: number;
 }
 
 export const createEmployee = api(
@@ -300,10 +314,22 @@ export const createEmployee = api(
 
 		// Insert salary for current month/year
 		await db.exec`
-      INSERT INTO salaries (employee_id, customer_id, monthly_amount, effective_month, effective_year)
-      VALUES (${emp!.id}, ${req.customer_id}, ${req.monthly_salary}, ${month}, ${year})
+      INSERT INTO salaries (
+        employee_id, customer_id, monthly_amount, effective_month, effective_year,
+        basic_amount, housing_allowance, transport_allowance, other_allowance
+      )
+      VALUES (
+        ${emp!.id}, ${req.customer_id}, ${req.monthly_salary}, ${month}, ${year},
+        ${req.basic_amount ?? null}, ${req.housing_allowance ?? null},
+        ${req.transport_allowance ?? null}, ${req.other_allowance ?? null}
+      )
       ON CONFLICT (employee_id, effective_month, effective_year)
-      DO UPDATE SET monthly_amount = EXCLUDED.monthly_amount
+      DO UPDATE SET
+        monthly_amount      = EXCLUDED.monthly_amount,
+        basic_amount        = EXCLUDED.basic_amount,
+        housing_allowance   = EXCLUDED.housing_allowance,
+        transport_allowance = EXCLUDED.transport_allowance,
+        other_allowance     = EXCLUDED.other_allowance
     `;
 
 		// Insert billing record for current year
@@ -330,7 +356,11 @@ export const createEmployee = api(
         COALESCE(s.monthly_amount, 0)                                AS monthly_salary,
         COALESCE(br.monthly_rate, 0)                                 AS monthly_billing,
         COALESCE(br.annual_amount, 0)                                AS annual_billing,
-        COALESCE(br.billing_year, ${year})                           AS billing_year
+        COALESCE(br.billing_year, ${year})                           AS billing_year,
+        s.basic_amount::float8                                       AS basic_amount,
+        s.housing_allowance::float8                                  AS housing_allowance,
+        s.transport_allowance::float8                                AS transport_allowance,
+        s.other_allowance::float8                                    AS other_allowance
       FROM employees e
       JOIN customers c ON e.customer_id = c.id
       LEFT JOIN salaries s
@@ -351,6 +381,11 @@ interface UpdateEmployeeRequest {
 	billing_months_override?: number | null;
 	monthly_salary?: number;
 	monthly_billing?: number;
+	// Optional salary component breakdown (should sum to monthly_salary)
+	basic_amount?: number | null;
+	housing_allowance?: number | null;
+	transport_allowance?: number | null;
+	other_allowance?: number | null;
 }
 
 export const updateEmployee = api(
@@ -390,10 +425,22 @@ export const updateEmployee = api(
 		// Update salary if provided
 		if (req.monthly_salary !== undefined) {
 			await db.exec`
-        INSERT INTO salaries (employee_id, customer_id, monthly_amount, effective_month, effective_year)
-        VALUES (${id}, ${customerId}, ${req.monthly_salary}, ${month}, ${year})
+        INSERT INTO salaries (
+          employee_id, customer_id, monthly_amount, effective_month, effective_year,
+          basic_amount, housing_allowance, transport_allowance, other_allowance
+        )
+        VALUES (
+          ${id}, ${customerId}, ${req.monthly_salary}, ${month}, ${year},
+          ${req.basic_amount ?? null}, ${req.housing_allowance ?? null},
+          ${req.transport_allowance ?? null}, ${req.other_allowance ?? null}
+        )
         ON CONFLICT (employee_id, effective_month, effective_year)
-        DO UPDATE SET monthly_amount = EXCLUDED.monthly_amount
+        DO UPDATE SET
+          monthly_amount      = EXCLUDED.monthly_amount,
+          basic_amount        = COALESCE(EXCLUDED.basic_amount, salaries.basic_amount),
+          housing_allowance   = COALESCE(EXCLUDED.housing_allowance, salaries.housing_allowance),
+          transport_allowance = COALESCE(EXCLUDED.transport_allowance, salaries.transport_allowance),
+          other_allowance     = COALESCE(EXCLUDED.other_allowance, salaries.other_allowance)
       `;
 		}
 
@@ -431,7 +478,11 @@ export const updateEmployee = api(
         COALESCE(s.monthly_amount, 0)                                AS monthly_salary,
         COALESCE(br.monthly_rate, 0)                                 AS monthly_billing,
         COALESCE(br.annual_amount, 0)                                AS annual_billing,
-        COALESCE(br.billing_year, ${year})                           AS billing_year
+        COALESCE(br.billing_year, ${year})                           AS billing_year,
+        s.basic_amount::float8                                       AS basic_amount,
+        s.housing_allowance::float8                                  AS housing_allowance,
+        s.transport_allowance::float8                                AS transport_allowance,
+        s.other_allowance::float8                                    AS other_allowance
       FROM employees e
       JOIN customers c ON e.customer_id = c.id
       LEFT JOIN salaries s
@@ -443,6 +494,61 @@ export const updateEmployee = api(
 		return result!;
 	},
 );
+// ─── Employee compensation (internal – letter generation) ───────────────────
+
+export interface EmployeeCompensation {
+	id: string;
+	serial_no: number | null;
+	name: string;
+	position: string;
+	customer_id: string;
+	customer_name: string;
+	employee_since: string;
+	monthly_salary: number | null;
+	salary_month: number | null;
+	salary_year: number | null;
+	basic_amount: number | null;
+	housing_allowance: number | null;
+	transport_allowance: number | null;
+	other_allowance: number | null;
+}
+
+/**
+ * Internal endpoint used by the request service to assemble
+ * experience letters / salary certificates. Returns the employee
+ * with their most recent salary record (latest period wins).
+ */
+export const getEmployeeCompensation = api(
+	{ expose: false, auth: true, method: "GET", path: "/internal/employees/:id/compensation" },
+	async ({ id }: { id: string }): Promise<EmployeeCompensation> => {
+		const row = await db.queryRow<EmployeeCompensation>`
+      SELECT
+        e.id, e.serial_no, e.name, e.position,
+        c.id                          AS customer_id,
+        c.name                        AS customer_name,
+        e.created_at::TEXT            AS employee_since,
+        s.monthly_amount::float8      AS monthly_salary,
+        s.effective_month             AS salary_month,
+        s.effective_year              AS salary_year,
+        s.basic_amount::float8        AS basic_amount,
+        s.housing_allowance::float8   AS housing_allowance,
+        s.transport_allowance::float8 AS transport_allowance,
+        s.other_allowance::float8     AS other_allowance
+      FROM employees e
+      JOIN customers c ON e.customer_id = c.id
+      LEFT JOIN LATERAL (
+        SELECT * FROM salaries s
+        WHERE s.employee_id = e.id
+        ORDER BY s.effective_year DESC, s.effective_month DESC
+        LIMIT 1
+      ) s ON TRUE
+      WHERE e.id = ${id}
+    `;
+		if (!row) throw APIError.notFound("employee not found");
+		return row;
+	},
+);
+
 // ─── BDM ↔ Employee Assignments ───────────────────────────────────────────────
 
 export interface BdmAssignment {
