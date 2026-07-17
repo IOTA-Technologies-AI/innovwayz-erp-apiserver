@@ -96,15 +96,42 @@ export async function verifyOtp(params: {
 		},
 		body: JSON.stringify(body),
 	});
+
+	// Read the raw body once so we can both parse it and log it verbatim.
+	// Authentica returns the verification result in the 2xx body, so a silent
+	// shape mismatch here looks identical to a wrong code — always log it.
+	const text = await res.text().catch(() => "");
 	if (!res.ok) {
 		// A 4xx here usually means an incorrect/expired code.
-		const text = await res.text().catch(() => "");
 		log.info("authentica verify-otp rejected", { status: res.status, body: text });
 		return false;
 	}
-	const data = (await res.json().catch(() => ({}))) as {
+
+	let data: {
 		verified?: boolean;
 		success?: boolean;
-	};
-	return data.verified === true || data.success === true;
+		data?: { verified?: boolean; success?: boolean };
+	} = {};
+	try {
+		data = JSON.parse(text);
+	} catch {
+		log.error("authentica verify-otp: unparseable body", { status: res.status, body: text });
+		return false;
+	}
+
+	// Accept the documented top-level shape ({ verified: true } / { success: true })
+	// as well as Authentica's occasional { data: { ... } } wrapper. Only an
+	// explicit boolean true counts — never weaken this to a truthy check.
+	const verified =
+		data.verified === true ||
+		data.success === true ||
+		data.data?.verified === true ||
+		data.data?.success === true;
+
+	if (!verified) {
+		// 2xx but not recognised as a pass — this is the case that previously
+		// failed silently. Log the real body so the actual shape is visible.
+		log.warn("authentica verify-otp not verified", { status: res.status, body: text });
+	}
+	return verified;
 }
