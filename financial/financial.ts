@@ -740,8 +740,8 @@ export const updateJournalEntry = api(
 		lines: CreateLedgerLineInput[];
 	}): Promise<JournalEntry> => {
 		const { userID, role } = getAuthData()!;
-		if (role !== "super_admin")
-			throw APIError.permissionDenied("super_admin only");
+		if (!isAdmin(role))
+			throw APIError.permissionDenied("admin or super_admin only");
 
 		const entry = await db.queryRow<JournalEntry>`
       SELECT id, reference, fiscal_period, description, is_posted, is_locked, created_by, created_at, updated_at
@@ -812,8 +812,8 @@ export const deleteJournalEntry = api(
 	{ expose: true, auth: true, method: "DELETE", path: "/financial/journal-entries/:id" },
 	async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
 		const { userID, role } = getAuthData()!;
-		if (role !== "super_admin")
-			throw APIError.permissionDenied("super_admin only");
+		if (!isAdmin(role))
+			throw APIError.permissionDenied("admin or super_admin only");
 		const entry = await db.queryRow<{ is_locked: boolean }>`
       SELECT is_locked FROM journal_entries WHERE id = ${id}
     `;
@@ -1597,8 +1597,8 @@ export const purgeAutoEntries = api(
 	{ expose: true, auth: true, method: "POST", path: "/financial/auto-entries/purge" },
 	async (): Promise<{ removed: number }> => {
 		const { userID, role } = getAuthData()!;
-		if (role !== "super_admin")
-			throw APIError.permissionDenied("super_admin only");
+		if (!isAdmin(role))
+			throw APIError.permissionDenied("admin or super_admin only");
 		const res = await db.rawQueryRow<{ n: string }>(
 			`WITH del AS (
 			   DELETE FROM journal_entries
