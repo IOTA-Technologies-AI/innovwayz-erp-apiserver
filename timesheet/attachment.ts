@@ -4,8 +4,11 @@
 // Tesseract.js. OCR never blocks submission — it produces reviewer flags.
 // ─────────────────────────────────────────────────────────────────────────────
 
-import { createWorker } from "tesseract.js";
 import log from "encore.dev/log";
+// NOTE: tesseract.js is imported lazily inside ocrAndCompare (dynamic import)
+// so this heavy WASM dependency is never part of the critical path — if it
+// fails to load or bundle, OCR degrades to "unavailable" and the timesheet
+// portal keeps working. It must never block deployment or submission.
 
 export const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
 
@@ -111,6 +114,8 @@ export async function ocrAndCompare(
 	}
 
 	try {
+		// Lazy-load: only pull the OCR engine when an image is actually processed.
+		const { createWorker } = await import("tesseract.js");
 		const worker = await createWorker("eng");
 		try {
 			const { data } = await worker.recognize(buf);
