@@ -16,7 +16,8 @@
   },
   "dependencies": {
     "encore.dev": "1.52.3",
-    "pdfkit": "^0.19.1"
+    "pdfkit": "^0.19.1",
+    "tesseract.js": "^7.0.0"
   },
   "optionalDependencies": {
     "@rollup/rollup-linux-x64-gnu": "^4.13.0"

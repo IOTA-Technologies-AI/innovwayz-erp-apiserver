@@ -228,6 +228,9 @@ interface EmployeeWithDetails {
 	housing_allowance: number | null;
 	transport_allowance: number | null;
 	other_allowance: number | null;
+	// Contact (for the self-service timesheet portal)
+	mobile_number: string | null;
+	email: string | null;
 }
 
 interface ListEmployeesResponse {
@@ -241,6 +244,7 @@ export const listEmployees = api(
 		const rows = db.query<EmployeeWithDetails>`
       SELECT
         e.id, e.serial_no, e.name, e.position,
+        e.mobile_number, e.email,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -282,6 +286,9 @@ interface CreateEmployeeRequest {
 	housing_allowance?: number;
 	transport_allowance?: number;
 	other_allowance?: number;
+	// Contact
+	mobile_number?: string;
+	email?: string;
 }
 
 export const createEmployee = api(
@@ -303,11 +310,12 @@ export const createEmployee = api(
 
 		// Insert employee
 		const emp = await db.queryRow<{ id: string }>`
-      INSERT INTO employees (name, position, customer_id, billing_months_override, serial_no)
+      INSERT INTO employees (name, position, customer_id, billing_months_override, serial_no, mobile_number, email)
       VALUES (
         ${req.name}, ${req.position}, ${req.customer_id},
         ${req.billing_months_override ?? null},
-        ${req.serial_no ?? null}
+        ${req.serial_no ?? null},
+        ${req.mobile_number ?? null}, ${req.email ?? null}
       )
       RETURNING id
     `;
@@ -347,6 +355,7 @@ export const createEmployee = api(
 		const result = await db.queryRow<EmployeeWithDetails>`
       SELECT
         e.id, e.serial_no, e.name, e.position,
+        e.mobile_number, e.email,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -386,6 +395,9 @@ interface UpdateEmployeeRequest {
 	housing_allowance?: number | null;
 	transport_allowance?: number | null;
 	other_allowance?: number | null;
+	// Contact
+	mobile_number?: string | null;
+	email?: string | null;
 }
 
 export const updateEmployee = api(
@@ -418,7 +430,9 @@ export const updateEmployee = api(
         name                   = COALESCE(${req.name ?? null}, name),
         position               = COALESCE(${req.position ?? null}, position),
         customer_id            = ${customerId},
-        billing_months_override = ${billingMonthsOverride}
+        billing_months_override = ${billingMonthsOverride},
+        mobile_number          = CASE WHEN ${req.mobile_number !== undefined} THEN ${req.mobile_number ?? null} ELSE mobile_number END,
+        email                  = CASE WHEN ${req.email !== undefined} THEN ${req.email ?? null} ELSE email END
       WHERE id = ${id}
     `;
 
@@ -469,6 +483,7 @@ export const updateEmployee = api(
 		const result = await db.queryRow<EmployeeWithDetails>`
       SELECT
         e.id, e.serial_no, e.name, e.position,
+        e.mobile_number, e.email,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -494,6 +509,40 @@ export const updateEmployee = api(
 		return result!;
 	},
 );
+// ─── Employee lookup by mobile (internal – timesheet portal auth) ───────────
+
+export interface EmployeeContact {
+	id: string;
+	name: string;
+	position: string;
+	customer_id: string;
+	customer_name: string;
+	mobile_number: string | null;
+	email: string | null;
+}
+
+/**
+ * Internal endpoint used by the timesheet portal to resolve an employee
+ * from the mobile number they log in with. Returns null-safe not-found.
+ */
+export const getEmployeeByMobile = api(
+	// Internal-only (expose:false) and auth:false so it can be called from the
+	// unauthenticated timesheet-portal OTP flow.
+	{ expose: false, auth: false, method: "GET", path: "/internal/employees/by-mobile/:mobile" },
+	async ({ mobile }: { mobile: string }): Promise<EmployeeContact> => {
+		const normalized = mobile.replace(/[\s-]/g, "");
+		const row = await db.queryRow<EmployeeContact>`
+      SELECT e.id, e.name, e.position, e.mobile_number, e.email,
+             c.id AS customer_id, c.name AS customer_name
+      FROM employees e
+      JOIN customers c ON e.customer_id = c.id
+      WHERE REPLACE(REPLACE(e.mobile_number, ' ', ''), '-', '') = ${normalized}
+    `;
+		if (!row) throw APIError.notFound("no employee found with that mobile number");
+		return row;
+	},
+);
+
 // ─── Employee compensation (internal – letter generation) ───────────────────
 
 export interface EmployeeCompensation {

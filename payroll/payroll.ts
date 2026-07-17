@@ -1,6 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
+import { CronJob } from "encore.dev/cron";
 import { user, billing } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
@@ -323,6 +324,76 @@ interface GenerateMonthlyResponse {
 	total_net: number;
 }
 
+/**
+ * Core bulk-generation used by both the manual endpoint and the monthly
+ * cron. Creates one draft salary payment per employee with a positive
+ * monthly salary, skipping any that already exist for the period.
+ */
+async function generateForPeriod(
+	periodMonth: number,
+	periodYear: number,
+	userID: string,
+	creatorName: string | null,
+): Promise<GenerateMonthlyResponse> {
+	const { employees } = await billing.listEmployees();
+
+	let created = 0;
+	let skipped = 0;
+	let totalNet = 0;
+
+	for (const e of employees) {
+		const base = Number(e.monthly_salary) || 0;
+		if (base <= 0) {
+			skipped++;
+			continue;
+		}
+		const id = crypto.randomUUID();
+		const reference = await nextReference();
+		const net = computeNet(base, 0, 0);
+		const res = await db.rawQueryRow<{ id: string }>(
+			`INSERT INTO salary_payments (
+        id, reference, employee_id, employee_name, position, customer_id, customer_name,
+        period_month, period_year, base_amount, additions, deductions, net_amount,
+        currency, status, created_by, created_by_name
+      ) VALUES (
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, 'SAR', 'draft', $12, $13
+      )
+      ON CONFLICT (employee_id, period_month, period_year) DO NOTHING
+      RETURNING id`,
+			id, reference, e.id, e.name, e.position ?? null,
+			e.customer_id ?? null, e.customer_name ?? null,
+			periodMonth, periodYear, base, net, userID, creatorName,
+		);
+		if (res) {
+			created++;
+			totalNet += net;
+			await logEvent(id, "generated", userID, creatorName);
+		} else {
+			skipped++;
+		}
+	}
+
+	if (created > 0) {
+		void notifyRoles(
+			["admin", "super_admin", "manager"],
+			`Payroll generated for ${monthLabel(periodMonth, periodYear)} — ${created} salaries`,
+			emailShell(
+				"Monthly Payroll Generated",
+				`<tr><td style="padding:6px 0;color:#94a3b8;width:170px;">Period</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${monthLabel(periodMonth, periodYear)}</td></tr>
+         <tr><td style="padding:6px 0;color:#94a3b8;">Salaries created</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${created}</td></tr>
+        <tr><td style="padding:6px 0;color:#94a3b8;">Total net</td><td style="padding:6px 0;color:#0f172a;font-weight:700;">${SAR(totalNet)}</td></tr>`,
+				"These salary payments are drafts — review, adjust accruals/deductions, and submit for admin approval.",
+			),
+		);
+	}
+
+	return {
+		created,
+		skipped,
+		total_net: Math.round(totalNet * 100) / 100,
+	};
+}
+
 export const generateMonthlyPayroll = api(
 	{ expose: true, auth: true, method: "POST", path: "/payroll/generate" },
 	async (req: GenerateMonthlyRequest): Promise<GenerateMonthlyResponse> => {
@@ -340,75 +411,35 @@ export const generateMonthlyPayroll = api(
 			throw APIError.invalidArgument("a valid period month/year is required");
 
 		const creatorName = await actorNameOf(userID);
-		const { employees } = await billing.listEmployees();
-
-		let created = 0;
-		let skipped = 0;
-		let totalNet = 0;
-
-		for (const e of employees) {
-			const base = Number(e.monthly_salary) || 0;
-			if (base <= 0) {
-				skipped++;
-				continue;
-			}
-			const id = crypto.randomUUID();
-			const reference = await nextReference();
-			const net = computeNet(base, 0, 0);
-			const res = await db.rawQueryRow<{ id: string }>(
-				`INSERT INTO salary_payments (
-          id, reference, employee_id, employee_name, position, customer_id, customer_name,
-          period_month, period_year, base_amount, additions, deductions, net_amount,
-          currency, status, created_by, created_by_name
-        ) VALUES (
-          $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, 'SAR', 'draft', $12, $13
-        )
-        ON CONFLICT (employee_id, period_month, period_year) DO NOTHING
-        RETURNING id`,
-				id,
-				reference,
-				e.id,
-				e.name,
-				e.position ?? null,
-				e.customer_id ?? null,
-				e.customer_name ?? null,
-				req.period_month,
-				req.period_year,
-				base,
-				net,
-				userID,
-				creatorName,
-			);
-			if (res) {
-				created++;
-				totalNet += net;
-				await logEvent(id, "generated", userID, creatorName);
-			} else {
-				skipped++;
-			}
-		}
-
-		if (created > 0) {
-			void notifyRoles(
-				["manager", "admin", "super_admin"],
-				`Payroll generated for ${monthLabel(req.period_month, req.period_year)} — ${created} salaries`,
-				emailShell(
-					"Monthly Payroll Generated",
-					`<tr><td style="padding:6px 0;color:#94a3b8;width:170px;">Period</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${monthLabel(req.period_month, req.period_year)}</td></tr>
-           <tr><td style="padding:6px 0;color:#94a3b8;">Salaries created</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${created}</td></tr>
-					<tr><td style="padding:6px 0;color:#94a3b8;">Total net</td><td style="padding:6px 0;color:#0f172a;font-weight:700;">${SAR(totalNet)}</td></tr>`,
-					"These salary payments are drafts — review and post them to start the approval workflow.",
-				),
-			);
-		}
-
-		return {
-			created,
-			skipped,
-			total_net: Math.round(totalNet * 100) / 100,
-		};
+		return generateForPeriod(req.period_month, req.period_year, userID, creatorName);
 	},
 );
+
+// ─── Auto-generate on the 25th of each month ──────────────────────────────────
+
+/**
+ * Cron target: generate the current month's payroll automatically so it is
+ * ready for admin review/approval by month-end. Runs unauthenticated as the
+ * system actor; drafts still require the normal approve → finance flow.
+ */
+export const autoGenerateMonthlyPayroll = api(
+	{ expose: false, method: "POST", path: "/payroll/auto-generate" },
+	async (): Promise<GenerateMonthlyResponse> => {
+		const now = new Date();
+		const month = now.getMonth() + 1;
+		const year = now.getFullYear();
+		const result = await generateForPeriod(month, year, "system", "Automated Payroll");
+		log.info("auto payroll generated", { month, year, created: result.created, skipped: result.skipped });
+		return result;
+	},
+);
+
+const _payrollCron = new CronJob("monthly-payroll-generate", {
+	title: "Generate monthly payroll on the 25th",
+	schedule: "0 6 25 * *",
+	endpoint: autoGenerateMonthlyPayroll,
+});
+
 
 // ─── List / Get ───────────────────────────────────────────────────────────────
 
