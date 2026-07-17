@@ -569,6 +569,27 @@ export const sendInvoice = api(
 			.catch(() => ({ name: null as string | null }));
 		await logEvent(req.id, "sent", userID, contact.name ?? null);
 
+		// ── Accrual entry: Dr 11300 A/R / Cr 41100 Revenue (recognise billing) ──
+		if (inv.status === "draft") {
+			void financial
+				.recordAutoEntry({
+					fiscal_period: issue.slice(0, 7),
+					reference_source: `${inv.reference}:bill`,
+					description: `Invoice issued — ${inv.reference} — ${inv.customer_name}`,
+					debit_account: "11300", // Accounts Receivable
+					credit_account: "41100", // Revenue
+					amount: round2(Number(inv.total_amount)),
+					actor_id: userID,
+					actor_name: contact.name ?? null,
+				})
+				.catch((e) =>
+					log.warn("auto A/R entry failed for invoice", {
+						id: req.id,
+						error: String(e),
+					}),
+				);
+		}
+
 		const updated = await fetchInvoice(req.id);
 		await notifyRoles(
 			["finance"],
@@ -636,20 +657,23 @@ export const payInvoice = api(
 			`Received ${SAR(increment)} (total paid ${SAR(newPaid)})`,
 		);
 
-		// ── Auto journal entry: Dr 11100 Cash / Cr 41100 Revenue ──────────────
+		// ── Cash receipt: Dr 11100 Cash / Cr 11300 A/R (clears the receivable) ──
+		// Revenue was already recognised when the invoice was issued (A/R entry),
+		// so a payment only moves cash against the receivable — it does not
+		// re-recognise revenue.
 		void financial
 			.recordAutoEntry({
 				fiscal_period: paidDate.slice(0, 7),
-				reference_source: inv.reference,
+				reference_source: `${inv.reference}:pay`,
 				description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
 				debit_account: "11100", // Corporate Operating Account (cash in)
-				credit_account: "41100", // Bank Tier-1 Placement Fees (revenue)
+				credit_account: "11300", // Accounts Receivable (cleared)
 				amount: increment,
 				actor_id: userID,
 				actor_name: contact.name ?? null,
 			})
 			.catch((e) =>
-				log.warn("auto financial entry failed for invoice", {
+				log.warn("auto cash-receipt entry failed for invoice", {
 					id: req.id,
 					error: String(e),
 				}),
@@ -788,11 +812,11 @@ interface ReconcileResult {
 }
 
 /**
- * Backfill missing revenue journal entries for invoices that are paid or
- * partially paid but under-posted in the ledger (e.g. paid before auto-posting
- * existed, or a transient posting failure). Idempotent: it only posts the
- * difference between the amount actually paid and what is already on the
- * ledger for that invoice reference, so repeated runs are safe.
+ * Backfill missing accrual entries for issued invoices so the ledger reflects
+ * both the billing (Dr A/R / Cr Revenue for the invoiced total) and any cash
+ * received (Dr Cash / Cr A/R for the paid amount). Idempotent: posts only the
+ * difference between the expected amount and what is already on the ledger for
+ * each stage (keyed on `<ref>:bill` / `<ref>:pay`), so repeated runs are safe.
  */
 export const reconcileInvoicesToLedger = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/reconcile-ledger" },
@@ -803,48 +827,80 @@ export const reconcileInvoicesToLedger = api(
 		const contact = await user
 			.getContact({ id: userID })
 			.catch(() => ({ name: null as string | null }));
+		const actorName = contact.name ?? null;
 
 		const rows = db.rawQuery<{
 			reference: string;
 			customer_name: string | null;
+			total_amount: string;
 			paid_amount: string | null;
+			issue_date: string | null;
 			paid_date: string | null;
 		}>(
-			`SELECT reference, customer_name, paid_amount::TEXT AS paid_amount, paid_date::TEXT AS paid_date
-			 FROM invoices WHERE status IN ('paid','partially_paid')`,
+			`SELECT reference, customer_name,
+			        total_amount::TEXT AS total_amount, paid_amount::TEXT AS paid_amount,
+			        issue_date::TEXT AS issue_date, paid_date::TEXT AS paid_date
+			 FROM invoices WHERE status IN ('sent','partially_paid','paid')`,
 		);
 
+		const today = new Date().toISOString().slice(0, 10);
 		let checked = 0;
 		let posted = 0;
 		let amountPosted = 0;
 		for await (const inv of rows) {
 			checked++;
+			// 1. Billing accrual (Dr A/R / Cr Revenue) for the invoiced total.
+			const total = round2(Number(inv.total_amount ?? 0));
+			if (total > 0) {
+				const billed = await financial.postedAmountForSource({
+					source_ref: `${inv.reference}:bill`,
+				});
+				const billDiff = round2(total - Number(billed.credit));
+				if (billDiff > 0.005) {
+					try {
+						await financial.recordAutoEntry({
+							fiscal_period: (inv.issue_date ?? today).slice(0, 7),
+							reference_source: `${inv.reference}:bill`,
+							description: `Invoice issued (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
+							debit_account: "11300",
+							credit_account: "41100",
+							amount: billDiff,
+							actor_id: userID,
+							actor_name: actorName,
+						});
+						posted++;
+						amountPosted = round2(amountPosted + billDiff);
+					} catch (err) {
+						log.warn("invoice billing reconcile failed", { reference: inv.reference, error: String(err) });
+					}
+				}
+			}
+
+			// 2. Cash receipt (Dr Cash / Cr A/R) for the amount actually paid.
 			const paid = round2(Number(inv.paid_amount ?? 0));
-			if (paid <= 0) continue;
-			const { credit } = await financial.postedAmountForSource({
-				source_ref: inv.reference,
-			});
-			const diff = round2(paid - Number(credit));
-			if (diff <= 0.005) continue;
-			const period = (inv.paid_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
-			try {
-				await financial.recordAutoEntry({
-					fiscal_period: period,
-					reference_source: inv.reference,
-					description: `Invoice payment (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
-					debit_account: "11100",
-					credit_account: "41100",
-					amount: diff,
-					actor_id: userID,
-					actor_name: contact.name ?? null,
+			if (paid > 0) {
+				const received = await financial.postedAmountForSource({
+					source_ref: `${inv.reference}:pay`,
 				});
-				posted++;
-				amountPosted = round2(amountPosted + diff);
-			} catch (err) {
-				log.warn("invoice reconcile posting failed", {
-					reference: inv.reference,
-					error: String(err),
-				});
+				const payDiff = round2(paid - Number(received.debit));
+				if (payDiff > 0.005) {
+					try {
+						await financial.recordAutoEntry({
+							fiscal_period: (inv.paid_date ?? today).slice(0, 7),
+							reference_source: `${inv.reference}:pay`,
+							description: `Invoice payment (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
+							debit_account: "11100",
+							credit_account: "11300",
+							amount: payDiff,
+							actor_id: userID,
+							actor_name: actorName,
+						});
+						posted++;
+						amountPosted = round2(amountPosted + payDiff);
+					} catch (err) {
+						log.warn("invoice receipt reconcile failed", { reference: inv.reference, error: String(err) });
+					}
+				}
 			}
 		}
 		return { checked, posted, amount_posted: amountPosted };

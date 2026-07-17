@@ -699,6 +699,23 @@ export const approveExpense = api(
       `;
 			await logEvent(id, "admin_approved", userID, actorName);
 			const updated = await fetchExpense(id);
+
+			// ── Accrual: Dr [expense acct] / Cr 21100 A/P (recognise the cost) ──
+			void financial
+				.recordAutoEntry({
+					fiscal_period: (updated.expense_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7),
+					reference_source: `${updated.reference}:accrue`,
+					description: `Expense approved — ${updated.reference} — ${updated.title}`,
+					debit_account: mapExpenseClassToAccount(updated.expense_class),
+					credit_account: "21100", // Accounts Payable
+					amount: Number(updated.amount),
+					actor_id: userID,
+					actor_name: actorName,
+				})
+				.catch((err: unknown) =>
+					log.warn("auto A/P accrual failed for expense", { id, error: String(err) }),
+				);
+
 			void notifyRoles(
 				["finance", "super_admin"],
 				`Expense approved — ready for processing — ${updated.reference}`,
@@ -859,22 +876,25 @@ export const processExpense = api(
 			);
 			const updated = await fetchExpense(id);
 
-			// ── Auto journal entry: Dr [expense acct] / Cr 11100 Cash ──────────
+			// ── Payment: Dr 21100 A/P / Cr 11100 Cash (clears the payable) ──────
+			// The cost was recognised when the expense was approved (A/P accrual),
+			// so payment only moves cash against the payable. If the expense was
+			// never accrued (e.g. approved before this mapping), the reconcile
+			// backfills the accrual leg.
 			const paidAmt = Number(paid_amount ?? e.amount);
-			const expAcct = mapExpenseClassToAccount(e.expense_class);
 			void financial
 				.recordAutoEntry({
 					fiscal_period: new Date().toISOString().slice(0, 7),
-					reference_source: e.reference,
+					reference_source: `${e.reference}:pay`,
 					description: `Expense paid — ${e.reference} — ${e.title}`,
-					debit_account: expAcct, // Expense account (cost recognised)
+					debit_account: "21100", // Accounts Payable (cleared)
 					credit_account: "11100", // Corporate Operating Account (cash out)
 					amount: paidAmt,
 					actor_id: userID,
 					actor_name: actorName,
 				})
 				.catch((err: unknown) =>
-					log.warn("auto financial entry failed for expense", {
+					log.warn("auto cash-payment entry failed for expense", {
 						id,
 						error: String(err),
 					}),
@@ -1415,10 +1435,10 @@ interface ExpenseReconcileResult {
 }
 
 /**
- * Backfill missing expense journal entries for expenses that are paid but
- * under-posted in the ledger. Idempotent: posts only the difference between
- * the amount paid and what is already on the ledger for that expense
- * reference, so repeated runs are safe.
+ * Backfill missing accrual entries for approved/paid expenses: the cost
+ * accrual (Dr Expense / Cr A/P) for the approved amount, and the cash payment
+ * (Dr A/P / Cr Cash) for the amount actually paid. Idempotent per stage
+ * (keyed on `<ref>:accrue` / `<ref>:pay`), so repeated runs are safe.
  */
 export const reconcileExpensesToLedger = api(
 	{ expose: true, auth: true, method: "POST", path: "/expenses/reconcile-ledger" },
@@ -1429,52 +1449,84 @@ export const reconcileExpensesToLedger = api(
 		const contact = await user
 			.getContact({ id: userID })
 			.catch(() => ({ name: null as string | null }));
+		const actorName = contact.name ?? null;
 		const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
 		const rows = db.rawQuery<{
 			reference: string;
 			title: string;
 			expense_class: string;
+			status: string;
 			amount: string;
 			paid_amount: string | null;
 			expense_date: string | null;
 		}>(
-			`SELECT reference, title, expense_class, amount::TEXT AS amount,
+			`SELECT reference, title, expense_class, status, amount::TEXT AS amount,
 			        paid_amount::TEXT AS paid_amount, expense_date::TEXT AS expense_date
-			 FROM expenses WHERE status = 'paid'`,
+			 FROM expenses WHERE status IN ('approved','processing','paid')`,
 		);
 
+		const today = new Date().toISOString().slice(0, 10);
 		let checked = 0;
 		let posted = 0;
 		let amountPosted = 0;
 		for await (const e of rows) {
 			checked++;
-			const paid = r2(Number(e.paid_amount ?? e.amount));
-			if (paid <= 0) continue;
-			const { debit } = await financial.postedAmountForSource({
-				source_ref: e.reference,
-			});
-			const diff = r2(paid - Number(debit));
-			if (diff <= 0.005) continue;
-			const period = (e.expense_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
-			try {
-				await financial.recordAutoEntry({
-					fiscal_period: period,
-					reference_source: e.reference,
-					description: `Expense paid (reconciled) — ${e.reference} — ${e.title}`,
-					debit_account: mapExpenseClassToAccount(e.expense_class),
-					credit_account: "11100",
-					amount: diff,
-					actor_id: userID,
-					actor_name: contact.name ?? null,
+			const period = (e.expense_date ?? today).slice(0, 7);
+			// 1. Cost accrual (Dr Expense / Cr A/P) for the approved amount.
+			const amount = r2(Number(e.amount ?? 0));
+			if (amount > 0) {
+				const accrued = await financial.postedAmountForSource({
+					source_ref: `${e.reference}:accrue`,
 				});
-				posted++;
-				amountPosted = r2(amountPosted + diff);
-			} catch (err) {
-				log.warn("expense reconcile posting failed", {
-					reference: e.reference,
-					error: String(err),
-				});
+				const accrueDiff = r2(amount - Number(accrued.debit));
+				if (accrueDiff > 0.005) {
+					try {
+						await financial.recordAutoEntry({
+							fiscal_period: period,
+							reference_source: `${e.reference}:accrue`,
+							description: `Expense approved (reconciled) — ${e.reference} — ${e.title}`,
+							debit_account: mapExpenseClassToAccount(e.expense_class),
+							credit_account: "21100",
+							amount: accrueDiff,
+							actor_id: userID,
+							actor_name: actorName,
+						});
+						posted++;
+						amountPosted = r2(amountPosted + accrueDiff);
+					} catch (err) {
+						log.warn("expense accrual reconcile failed", { reference: e.reference, error: String(err) });
+					}
+				}
+			}
+
+			// 2. Cash payment (Dr A/P / Cr Cash) for the amount actually paid.
+			if (e.status === "paid") {
+				const paid = r2(Number(e.paid_amount ?? e.amount));
+				if (paid > 0) {
+					const settled = await financial.postedAmountForSource({
+						source_ref: `${e.reference}:pay`,
+					});
+					const payDiff = r2(paid - Number(settled.debit));
+					if (payDiff > 0.005) {
+						try {
+							await financial.recordAutoEntry({
+								fiscal_period: period,
+								reference_source: `${e.reference}:pay`,
+								description: `Expense paid (reconciled) — ${e.reference} — ${e.title}`,
+								debit_account: "21100",
+								credit_account: "11100",
+								amount: payDiff,
+								actor_id: userID,
+								actor_name: actorName,
+							});
+							posted++;
+							amountPosted = r2(amountPosted + payDiff);
+						} catch (err) {
+							log.warn("expense payment reconcile failed", { reference: e.reference, error: String(err) });
+						}
+					}
+				}
 			}
 		}
 		return { checked, posted, amount_posted: amountPosted };

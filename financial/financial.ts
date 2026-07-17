@@ -1441,6 +1441,66 @@ export const recordAutoEntry = api(
 );
 
 /**
+ * Preview which auto-generated journal entries would be removed by a purge.
+ * Read-only. Auto entries are those recorded via recordAutoEntry, tagged
+ * `auto_created` in the audit log.
+ */
+export const previewAutoEntryPurge = api(
+	{ expose: true, auth: true, method: "GET", path: "/financial/auto-entries/preview" },
+	async (): Promise<{ count: number; total_debit: number; total_credit: number }> => {
+		const { role } = getAuthData()!;
+		if (!canManage(role))
+			throw APIError.permissionDenied("Finance or Admin role required");
+		const row = await db.rawQueryRow<{ n: string; d: string; c: string }>(
+			`SELECT COUNT(DISTINCT je.id)::TEXT AS n,
+			        COALESCE(SUM(ll.debit),0)::TEXT AS d,
+			        COALESCE(SUM(ll.credit),0)::TEXT AS c
+			 FROM journal_entries je
+			 JOIN ledger_lines ll ON ll.journal_entry_id = je.id
+			 WHERE je.id IN (
+			   SELECT record_id FROM financial_audit_log
+			   WHERE table_name = 'journal_entries' AND action = 'auto_created'
+			 )`,
+		);
+		return {
+			count: Number.parseInt(row?.n ?? "0", 10),
+			total_debit: Number(row?.d ?? 0),
+			total_credit: Number(row?.c ?? 0),
+		};
+	},
+);
+
+/**
+ * Remove all auto-generated journal entries (ledger lines cascade). Used to
+ * rebuild the ledger from source after a mapping change. Intended to be
+ * followed immediately by reconciliation, which re-posts the correct entries.
+ * super_admin only — this deletes financial records.
+ */
+export const purgeAutoEntries = api(
+	{ expose: true, auth: true, method: "POST", path: "/financial/auto-entries/purge" },
+	async (): Promise<{ removed: number }> => {
+		const { userID, role } = getAuthData()!;
+		if (role !== "super_admin")
+			throw APIError.permissionDenied("super_admin only");
+		const res = await db.rawQueryRow<{ n: string }>(
+			`WITH del AS (
+			   DELETE FROM journal_entries
+			   WHERE id IN (
+			     SELECT record_id FROM financial_audit_log
+			     WHERE table_name = 'journal_entries' AND action = 'auto_created'
+			   )
+			   RETURNING id
+			 )
+			 SELECT COUNT(*)::TEXT AS n FROM del`,
+		);
+		const removed = Number.parseInt(res?.n ?? "0", 10);
+		await audit("journal_entries", "*", "auto_purge", userID, null, { removed });
+		log.info("purged auto journal entries", { removed });
+		return { removed };
+	},
+);
+
+/**
  * Internal: how much has already been posted to the ledger for a given source
  * reference (an invoice or expense reference). Used by reconciliation to
  * backfill only the missing amount, so it is safe to run repeatedly.
