@@ -84,6 +84,10 @@ function isFinance(role: string): boolean {
 	return ["finance", "super_admin"].includes(role);
 }
 
+// Automatic expense→ledger posting is OFF (see invoice service note). The
+// organisation's books are maintained manually via journal entries.
+const AUTO_POST_TO_LEDGER = false;
+
 const EXPENSE_COLUMNS = `
   id, reference, category, expense_class, expense_type_code, expense_type_name,
   employee_id, employee_name, customer_id, customer_name,
@@ -701,6 +705,7 @@ export const approveExpense = api(
 			const updated = await fetchExpense(id);
 
 			// ── Accrual: Dr [expense acct] / Cr 21100 A/P (recognise the cost) ──
+			if (AUTO_POST_TO_LEDGER)
 			void financial
 				.recordAutoEntry({
 					fiscal_period: (updated.expense_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7),
@@ -877,28 +882,25 @@ export const processExpense = api(
 			const updated = await fetchExpense(id);
 
 			// ── Payment: Dr 21100 A/P / Cr 11100 Cash (clears the payable) ──────
-			// The cost was recognised when the expense was approved (A/P accrual),
-			// so payment only moves cash against the payable. If the expense was
-			// never accrued (e.g. approved before this mapping), the reconcile
-			// backfills the accrual leg.
 			const paidAmt = Number(paid_amount ?? e.amount);
-			void financial
-				.recordAutoEntry({
-					fiscal_period: new Date().toISOString().slice(0, 7),
-					reference_source: `${e.reference}:pay`,
-					description: `Expense paid — ${e.reference} — ${e.title}`,
-					debit_account: "21100", // Accounts Payable (cleared)
-					credit_account: "11100", // Corporate Operating Account (cash out)
-					amount: paidAmt,
-					actor_id: userID,
-					actor_name: actorName,
-				})
-				.catch((err: unknown) =>
-					log.warn("auto cash-payment entry failed for expense", {
-						id,
-						error: String(err),
-					}),
-				);
+			if (AUTO_POST_TO_LEDGER)
+				void financial
+					.recordAutoEntry({
+						fiscal_period: new Date().toISOString().slice(0, 7),
+						reference_source: `${e.reference}:pay`,
+						description: `Expense paid — ${e.reference} — ${e.title}`,
+						debit_account: "21100", // Accounts Payable (cleared)
+						credit_account: "11100", // Corporate Operating Account (cash out)
+						amount: paidAmt,
+						actor_id: userID,
+						actor_name: actorName,
+					})
+					.catch((err: unknown) =>
+						log.warn("auto cash-payment entry failed for expense", {
+							id,
+							error: String(err),
+						}),
+					);
 
 			void notifyUser(
 				updated.created_by,

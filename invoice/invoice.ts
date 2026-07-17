@@ -175,6 +175,12 @@ function addDays(dateStr: string, days: number): string {
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
+// Automatic invoice→ledger posting is OFF. The organisation's books are the
+// manually-maintained ledger (seed + manual journal entries); auto-posting
+// operational invoices polluted the real bank balance. Flip to true only if
+// invoice data represents the actual books of account.
+const AUTO_POST_TO_LEDGER = false;
+
 // ─── Create ───────────────────────────────────────────────────────────────────
 
 interface CreateInvoiceRequest {
@@ -570,7 +576,7 @@ export const sendInvoice = api(
 		await logEvent(req.id, "sent", userID, contact.name ?? null);
 
 		// ── Accrual entry: Dr 11300 A/R / Cr 41100 Revenue (recognise billing) ──
-		if (inv.status === "draft") {
+		if (AUTO_POST_TO_LEDGER && inv.status === "draft") {
 			void financial
 				.recordAutoEntry({
 					fiscal_period: issue.slice(0, 7),
@@ -658,26 +664,25 @@ export const payInvoice = api(
 		);
 
 		// ── Cash receipt: Dr 11100 Cash / Cr 11300 A/R (clears the receivable) ──
-		// Revenue was already recognised when the invoice was issued (A/R entry),
-		// so a payment only moves cash against the receivable — it does not
-		// re-recognise revenue.
-		void financial
-			.recordAutoEntry({
-				fiscal_period: paidDate.slice(0, 7),
-				reference_source: `${inv.reference}:pay`,
-				description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
-				debit_account: "11100", // Corporate Operating Account (cash in)
-				credit_account: "11300", // Accounts Receivable (cleared)
-				amount: increment,
-				actor_id: userID,
-				actor_name: contact.name ?? null,
-			})
-			.catch((e) =>
-				log.warn("auto cash-receipt entry failed for invoice", {
-					id: req.id,
-					error: String(e),
-				}),
-			);
+		if (AUTO_POST_TO_LEDGER) {
+			void financial
+				.recordAutoEntry({
+					fiscal_period: paidDate.slice(0, 7),
+					reference_source: `${inv.reference}:pay`,
+					description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
+					debit_account: "11100", // Corporate Operating Account (cash in)
+					credit_account: "11300", // Accounts Receivable (cleared)
+					amount: increment,
+					actor_id: userID,
+					actor_name: contact.name ?? null,
+				})
+				.catch((e) =>
+					log.warn("auto cash-receipt entry failed for invoice", {
+						id: req.id,
+						error: String(e),
+					}),
+				);
+		}
 
 		return fetchInvoice(req.id);
 	},
