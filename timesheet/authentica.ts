@@ -108,9 +108,10 @@ export async function verifyOtp(params: {
 	}
 
 	let data: {
+		status?: boolean;
 		verified?: boolean;
 		success?: boolean;
-		data?: { verified?: boolean; success?: boolean };
+		data?: { status?: boolean; verified?: boolean; success?: boolean };
 	} = {};
 	try {
 		data = JSON.parse(text);
@@ -119,12 +120,15 @@ export async function verifyOtp(params: {
 		return false;
 	}
 
-	// Accept the documented top-level shape ({ verified: true } / { success: true })
-	// as well as Authentica's occasional { data: { ... } } wrapper. Only an
-	// explicit boolean true counts — never weaken this to a truthy check.
+	// Authentica's actual success shape is { "status": true, "message": "OTP
+	// verified successfully" } — `status` is the real field. Accept the
+	// documented `verified`/`success` aliases and an occasional { data: { ... } }
+	// wrapper too. Only an explicit boolean true counts — never a truthy check.
 	const verified =
+		data.status === true ||
 		data.verified === true ||
 		data.success === true ||
+		data.data?.status === true ||
 		data.data?.verified === true ||
 		data.data?.success === true;
 
