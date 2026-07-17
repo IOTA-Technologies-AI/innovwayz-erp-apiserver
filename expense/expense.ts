@@ -1405,3 +1405,78 @@ const _generationReminderCron = new CronJob("monthly-generation-reminder", {
 	schedule: "0 9 5 * *",
 	endpoint: checkGenerationReminder,
 });
+
+// ─── Reconcile paid expenses to the financial ledger ──────────────────────────
+
+interface ExpenseReconcileResult {
+	checked: number;
+	posted: number;
+	amount_posted: number;
+}
+
+/**
+ * Backfill missing expense journal entries for expenses that are paid but
+ * under-posted in the ledger. Idempotent: posts only the difference between
+ * the amount paid and what is already on the ledger for that expense
+ * reference, so repeated runs are safe.
+ */
+export const reconcileExpensesToLedger = api(
+	{ expose: true, auth: true, method: "POST", path: "/expenses/reconcile-ledger" },
+	async (): Promise<ExpenseReconcileResult> => {
+		const { userID, role } = getAuthData()!;
+		if (!isFinance(role) && !isManager(role))
+			throw APIError.permissionDenied("finance or admin only");
+		const contact = await user
+			.getContact({ id: userID })
+			.catch(() => ({ name: null as string | null }));
+		const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+		const rows = db.rawQuery<{
+			reference: string;
+			title: string;
+			expense_class: string;
+			amount: string;
+			paid_amount: string | null;
+			expense_date: string | null;
+		}>(
+			`SELECT reference, title, expense_class, amount::TEXT AS amount,
+			        paid_amount::TEXT AS paid_amount, expense_date::TEXT AS expense_date
+			 FROM expenses WHERE status = 'paid'`,
+		);
+
+		let checked = 0;
+		let posted = 0;
+		let amountPosted = 0;
+		for await (const e of rows) {
+			checked++;
+			const paid = r2(Number(e.paid_amount ?? e.amount));
+			if (paid <= 0) continue;
+			const { debit } = await financial.postedAmountForSource({
+				source_ref: e.reference,
+			});
+			const diff = r2(paid - Number(debit));
+			if (diff <= 0.005) continue;
+			const period = (e.expense_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
+			try {
+				await financial.recordAutoEntry({
+					fiscal_period: period,
+					reference_source: e.reference,
+					description: `Expense paid (reconciled) — ${e.reference} — ${e.title}`,
+					debit_account: mapExpenseClassToAccount(e.expense_class),
+					credit_account: "11100",
+					amount: diff,
+					actor_id: userID,
+					actor_name: contact.name ?? null,
+				});
+				posted++;
+				amountPosted = r2(amountPosted + diff);
+			} catch (err) {
+				log.warn("expense reconcile posting failed", {
+					reference: e.reference,
+					error: String(err),
+				});
+			}
+		}
+		return { checked, posted, amount_posted: amountPosted };
+	},
+);

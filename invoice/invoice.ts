@@ -778,3 +778,75 @@ export const invoiceStats = api(
 		};
 	},
 );
+
+// ─── Reconcile paid invoices to the financial ledger ──────────────────────────
+
+interface ReconcileResult {
+	checked: number;
+	posted: number;
+	amount_posted: number;
+}
+
+/**
+ * Backfill missing revenue journal entries for invoices that are paid or
+ * partially paid but under-posted in the ledger (e.g. paid before auto-posting
+ * existed, or a transient posting failure). Idempotent: it only posts the
+ * difference between the amount actually paid and what is already on the
+ * ledger for that invoice reference, so repeated runs are safe.
+ */
+export const reconcileInvoicesToLedger = api(
+	{ expose: true, auth: true, method: "POST", path: "/invoices/reconcile-ledger" },
+	async (): Promise<ReconcileResult> => {
+		const { userID, role } = getAuthData()!;
+		if (!isFinance(role) && !isManager(role))
+			throw APIError.permissionDenied("finance or admin only");
+		const contact = await user
+			.getContact({ id: userID })
+			.catch(() => ({ name: null as string | null }));
+
+		const rows = db.rawQuery<{
+			reference: string;
+			customer_name: string | null;
+			paid_amount: string | null;
+			paid_date: string | null;
+		}>(
+			`SELECT reference, customer_name, paid_amount::TEXT AS paid_amount, paid_date::TEXT AS paid_date
+			 FROM invoices WHERE status IN ('paid','partially_paid')`,
+		);
+
+		let checked = 0;
+		let posted = 0;
+		let amountPosted = 0;
+		for await (const inv of rows) {
+			checked++;
+			const paid = round2(Number(inv.paid_amount ?? 0));
+			if (paid <= 0) continue;
+			const { credit } = await financial.postedAmountForSource({
+				source_ref: inv.reference,
+			});
+			const diff = round2(paid - Number(credit));
+			if (diff <= 0.005) continue;
+			const period = (inv.paid_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7);
+			try {
+				await financial.recordAutoEntry({
+					fiscal_period: period,
+					reference_source: inv.reference,
+					description: `Invoice payment (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
+					debit_account: "11100",
+					credit_account: "41100",
+					amount: diff,
+					actor_id: userID,
+					actor_name: contact.name ?? null,
+				});
+				posted++;
+				amountPosted = round2(amountPosted + diff);
+			} catch (err) {
+				log.warn("invoice reconcile posting failed", {
+					reference: inv.reference,
+					error: String(err),
+				});
+			}
+		}
+		return { checked, posted, amount_posted: amountPosted };
+	},
+);

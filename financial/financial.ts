@@ -1439,3 +1439,24 @@ export const recordAutoEntry = api(
 		return { ok: true, journal_entry_id: id };
 	},
 );
+
+/**
+ * Internal: how much has already been posted to the ledger for a given source
+ * reference (an invoice or expense reference). Used by reconciliation to
+ * backfill only the missing amount, so it is safe to run repeatedly.
+ * Since every auto-entry is balanced, debit == credit == posted amount for
+ * that source; callers read the side that matches their document type.
+ */
+export const postedAmountForSource = api(
+	{ expose: false, method: "POST", path: "/financial/internal/posted-for-source" },
+	async ({ source_ref }: { source_ref: string }): Promise<{ debit: number; credit: number }> => {
+		const row = await db.rawQueryRow<{ d: string; c: string }>(
+			`SELECT COALESCE(SUM(ll.debit),0)::TEXT AS d, COALESCE(SUM(ll.credit),0)::TEXT AS c
+			 FROM ledger_lines ll
+			 JOIN journal_entries je ON ll.journal_entry_id = je.id
+			 WHERE je.is_posted = TRUE AND ll.description = $1`,
+			source_ref,
+		);
+		return { debit: Number(row?.d ?? 0), credit: Number(row?.c ?? 0) };
+	},
+);
