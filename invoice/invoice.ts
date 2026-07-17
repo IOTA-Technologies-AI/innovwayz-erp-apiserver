@@ -30,7 +30,6 @@ export interface Invoice {
 	period_year: number | null;
 	description: string | null;
 	amount: number;
-	tax_amount: number;
 	total_amount: number;
 	currency: string;
 	status: InvoiceStatus;
@@ -65,7 +64,7 @@ function canManage(role: string): boolean {
 const INVOICE_COLUMNS = `
   id, reference, customer_id, customer_name, employee_id, employee_name,
   period_month, period_year, description,
-  amount, tax_amount, total_amount, currency, status,
+  amount, total_amount, currency, status,
   issue_date, due_date, paid_date, paid_amount, payment_reference, notes,
   created_by, created_by_name, sent_by, sent_at, cancelled_by, cancelled_at,
   created_at, updated_at
@@ -192,7 +191,6 @@ interface CreateInvoiceRequest {
 	period_year?: number;
 	description?: string;
 	amount: number;
-	tax_amount?: number;
 	currency?: string;
 	issue_date?: string;
 	due_date?: string;
@@ -213,8 +211,7 @@ export const createInvoice = api(
 			throw APIError.invalidArgument("amount must be zero or positive");
 
 		const amount = round2(Number(req.amount));
-		const tax = round2(Number(req.tax_amount ?? 0));
-		const total = round2(amount + tax);
+		const total = amount; // No tax/VAT — total always equals the net amount.
 		const id = crypto.randomUUID();
 		const reference = await nextReference();
 		const contact = await user
@@ -225,13 +222,13 @@ export const createInvoice = api(
       INSERT INTO invoices (
         id, reference, customer_id, customer_name, employee_id, employee_name,
         period_month, period_year, description,
-        amount, tax_amount, total_amount, currency, status,
+        amount, total_amount, currency, status,
         issue_date, due_date, notes, created_by, created_by_name
       ) VALUES (
         ${id}, ${reference}, ${req.customer_id ?? null}, ${req.customer_name},
         ${req.employee_id ?? null}, ${req.employee_name ?? null},
         ${req.period_month ?? null}, ${req.period_year ?? null}, ${req.description ?? null},
-        ${amount}, ${tax}, ${total}, ${req.currency ?? "SAR"}, 'draft',
+        ${amount}, ${total}, ${req.currency ?? "SAR"}, 'draft',
         ${req.issue_date ?? null}, ${req.due_date ?? null}, ${req.notes ?? null},
         ${userID}, ${contact.name ?? null}
       )
@@ -305,14 +302,14 @@ export const generateMonthlyInvoices = api(
         INSERT INTO invoices (
           id, reference, customer_id, customer_name, employee_id, employee_name,
           period_month, period_year, description,
-          amount, tax_amount, total_amount, currency, status,
+          amount, total_amount, currency, status,
           created_by, created_by_name
         ) VALUES (
           ${id}, ${reference}, ${emp.customer_id}, ${emp.customer_name},
           ${emp.id}, ${emp.name},
           ${req.period_month}, ${req.period_year},
           ${`Monthly Outsourcing Services of ${emp.name}`},
-          ${total}, 0, ${total}, 'SAR', 'draft',
+          ${total}, ${total}, 'SAR', 'draft',
           ${userID}, ${contact.name ?? null}
         )
       `;
@@ -471,7 +468,6 @@ interface UpdateInvoiceRequest {
 	period_year?: number | null;
 	description?: string | null;
 	amount?: number;
-	tax_amount?: number;
 	issue_date?: string | null;
 	due_date?: string | null;
 	notes?: string | null;
@@ -492,9 +488,7 @@ export const updateInvoice = api(
 			);
 
 		const amount = req.amount != null ? round2(Number(req.amount)) : inv.amount;
-		const tax =
-			req.tax_amount != null ? round2(Number(req.tax_amount)) : inv.tax_amount;
-		const total = round2(amount + tax);
+		const total = amount; // No tax/VAT — total always equals the net amount.
 
 		await db.exec`
       UPDATE invoices SET
@@ -506,7 +500,6 @@ export const updateInvoice = api(
         period_year   = ${req.period_year !== undefined ? req.period_year : inv.period_year},
         description   = ${req.description !== undefined ? req.description : inv.description},
         amount        = ${amount},
-        tax_amount    = ${tax},
         total_amount  = ${total},
         issue_date    = ${req.issue_date !== undefined ? req.issue_date : inv.issue_date},
         due_date      = ${req.due_date !== undefined ? req.due_date : inv.due_date},

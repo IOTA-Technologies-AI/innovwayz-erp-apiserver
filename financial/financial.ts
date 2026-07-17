@@ -164,7 +164,6 @@ export interface PnLResult {
 	gross_profit: number;
 	net_operating_income: number;
 	net_profit: number;
-	tax_provision: number;
 }
 
 export interface BalanceSheetSection {
@@ -968,23 +967,14 @@ export const getProfitAndLoss = api(
 			}
 		}
 
-		// Tax provision from account 21300
-		const taxRow = await db.rawQueryRow<{ total_credit: number }>(
-			`SELECT COALESCE(SUM(ll.credit) - SUM(ll.debit), 0) AS total_credit
-       FROM ledger_lines ll
-       JOIN journal_entries je ON ll.journal_entry_id = je.id
-         AND je.is_posted = TRUE AND je.fiscal_period = $1
-       WHERE ll.account_code = '21300'`,
-			req.fiscal_period,
-		);
-		const taxProvision = Number(taxRow?.total_credit ?? 0);
-
+		// No tax/VAT in InnovWayz ERP — all ledger amounts are net figures, so
+		// Net Profit equals Net Operating Income (no tax provision is deducted).
 		const grossRevenue = revenueLines.reduce((s, l) => s + l.amount, 0);
 		const totalCogs = cogsLines.reduce((s, l) => s + l.amount, 0);
 		const totalOpex = opexLines.reduce((s, l) => s + l.amount, 0);
 		const grossProfit = grossRevenue - totalCogs;
 		const netOperatingIncome = grossProfit - totalOpex;
-		const netProfit = netOperatingIncome - taxProvision;
+		const netProfit = netOperatingIncome;
 
 		return {
 			period: req.fiscal_period,
@@ -995,7 +985,6 @@ export const getProfitAndLoss = api(
 			gross_profit: grossProfit,
 			net_operating_income: netOperatingIncome,
 			net_profit: netProfit,
-			tax_provision: taxProvision,
 		};
 	},
 );
@@ -1135,7 +1124,7 @@ export const getDisbursements = api(
 			};
 		}
 
-		// Compute P&L (tax_provision excluded — all ledger amounts are net)
+		// Compute P&L — no tax/VAT, so net profit is Net Operating Income
 		const pnl = await getProfitAndLoss({ fiscal_period: req.fiscal_period });
 
 		if (pnl.net_profit <= 0) {
