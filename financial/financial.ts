@@ -724,6 +724,123 @@ export const postJournalEntry = api(
 	},
 );
 
+// ─── Manual edit / delete (super_admin provision) ─────────────────────────────
+
+/**
+ * Edit a journal entry's description, period and lines. super_admin only.
+ * Allows correcting posted entries for minute manual adjustments; locked
+ * entries remain immutable. The change is fully audited.
+ */
+export const updateJournalEntry = api(
+	{ expose: true, auth: true, method: "PUT", path: "/financial/journal-entries/:id" },
+	async (req: {
+		id: string;
+		description?: string;
+		fiscal_period?: string;
+		lines: CreateLedgerLineInput[];
+	}): Promise<JournalEntry> => {
+		const { userID, role } = getAuthData()!;
+		if (role !== "super_admin")
+			throw APIError.permissionDenied("super_admin only");
+
+		const entry = await db.queryRow<JournalEntry>`
+      SELECT id, reference, fiscal_period, description, is_posted, is_locked, created_by, created_at, updated_at
+      FROM journal_entries WHERE id = ${req.id}
+    `;
+		if (!entry) throw APIError.notFound("Journal entry not found");
+		if (entry.is_locked)
+			throw APIError.failedPrecondition("Entry is locked and cannot be edited");
+
+		if (!req.lines || req.lines.length < 2)
+			throw APIError.invalidArgument("A journal entry must have at least 2 ledger lines");
+		if (req.fiscal_period && !/^\d{4}-\d{2}$/.test(req.fiscal_period))
+			throw APIError.invalidArgument("fiscal_period must be in YYYY-MM format");
+
+		let totalDebits = 0;
+		let totalCredits = 0;
+		for (const line of req.lines) {
+			totalDebits += line.debit ?? 0;
+			totalCredits += line.credit ?? 0;
+		}
+		if (Math.abs(totalDebits - totalCredits) > 0.005)
+			throw APIError.invalidArgument(
+				`Unbalanced entry: debits ${totalDebits.toFixed(2)} ≠ credits ${totalCredits.toFixed(2)}`,
+			);
+
+		// Validate all account codes exist and are active.
+		for (const line of req.lines) {
+			const acct = await db.queryRow<{ account_code: string }>`
+        SELECT account_code FROM chart_of_accounts WHERE account_code = ${line.account_code} AND is_active = TRUE
+      `;
+			if (!acct)
+				throw APIError.invalidArgument(`Unknown or inactive account: ${line.account_code}`);
+		}
+
+		await db.exec`
+      UPDATE journal_entries SET
+        description   = COALESCE(${req.description ?? null}, description),
+        fiscal_period = COALESCE(${req.fiscal_period ?? null}, fiscal_period),
+        updated_at    = NOW()
+      WHERE id = ${req.id}
+    `;
+		// Replace ledger lines wholesale.
+		await db.exec`DELETE FROM ledger_lines WHERE journal_entry_id = ${req.id}`;
+		for (const line of req.lines) {
+			await db.exec`
+        INSERT INTO ledger_lines (id, journal_entry_id, account_code, debit, credit, description)
+        VALUES (${crypto.randomUUID()}, ${req.id}, ${line.account_code}, ${line.debit ?? 0}, ${line.credit ?? 0}, ${line.description ?? null})
+      `;
+		}
+
+		await audit("journal_entries", req.id, "manual_edit", userID, null, {
+			was_posted: entry.is_posted,
+			line_count: req.lines.length,
+		});
+
+		const result = await db.queryRow<JournalEntry>`
+      SELECT id, reference, fiscal_period, description, is_posted, posted_at, posted_by,
+             posted_by_name, is_locked, created_by, created_by_name, created_at, updated_at
+      FROM journal_entries WHERE id = ${req.id}
+    `;
+		const lines = await collectLines(req.id);
+		return { ...result!, lines };
+	},
+);
+
+/** Delete a journal entry (ledger lines cascade). super_admin only. */
+export const deleteJournalEntry = api(
+	{ expose: true, auth: true, method: "DELETE", path: "/financial/journal-entries/:id" },
+	async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
+		const { userID, role } = getAuthData()!;
+		if (role !== "super_admin")
+			throw APIError.permissionDenied("super_admin only");
+		const entry = await db.queryRow<{ is_locked: boolean }>`
+      SELECT is_locked FROM journal_entries WHERE id = ${id}
+    `;
+		if (!entry) throw APIError.notFound("Journal entry not found");
+		if (entry.is_locked)
+			throw APIError.failedPrecondition("Entry is locked and cannot be deleted");
+		await db.exec`DELETE FROM journal_entries WHERE id = ${id}`;
+		await audit("journal_entries", id, "manual_delete", userID, null);
+		return { ok: true };
+	},
+);
+
+async function collectLines(entryId: string): Promise<LedgerLine[]> {
+	const rows = db.rawQuery<LedgerLine>(
+		`SELECT ll.id, ll.journal_entry_id, ll.account_code, coa.account_name,
+		        ll.debit, ll.credit, ll.description, ll.created_at
+		 FROM ledger_lines ll
+		 LEFT JOIN chart_of_accounts coa ON coa.account_code = ll.account_code
+		 WHERE ll.journal_entry_id = $1
+		 ORDER BY ll.debit DESC`,
+		entryId,
+	);
+	const out: LedgerLine[] = [];
+	for await (const r of rows) out.push(r);
+	return out;
+}
+
 // ─── 6. Trial Balance ─────────────────────────────────────────────────────────
 
 export const getTrialBalance = api(
