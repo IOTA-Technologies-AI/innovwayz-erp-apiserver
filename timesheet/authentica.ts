@@ -21,6 +21,27 @@ function apiKey(): string {
 	return k;
 }
 
+const REQUEST_TIMEOUT_MS = 12_000;
+
+/** fetch with a hard timeout so a stalled upstream never hangs the endpoint. */
+async function fetchWithTimeout(
+	url: string,
+	init: RequestInit,
+): Promise<Response> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+	try {
+		return await fetch(url, { ...init, signal: controller.signal });
+	} catch (err) {
+		if (err instanceof Error && err.name === "AbortError") {
+			throw new Error("verification service timed out");
+		}
+		throw err;
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
 /** Send an OTP over the requested channel. Throws on transport/API failure. */
 export async function sendOtp(params: {
 	channel: OtpChannel;
@@ -36,7 +57,7 @@ export async function sendOtp(params: {
 		body.phone = params.phone;
 	}
 
-	const res = await fetch(`${BASE_URL}/api/v2/send-otp`, {
+	const res = await fetchWithTimeout(`${BASE_URL}/api/v2/send-otp`, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",
@@ -47,7 +68,11 @@ export async function sendOtp(params: {
 	});
 	if (!res.ok) {
 		const text = await res.text().catch(() => "");
-		log.error("authentica send-otp failed", { status: res.status, body: text });
+		log.error("authentica send-otp failed", {
+			status: res.status,
+			channel: params.channel,
+			body: text,
+		});
 		throw new Error(`failed to send verification code (${res.status})`);
 	}
 }
@@ -62,7 +87,7 @@ export async function verifyOtp(params: {
 	if (params.email) body.email = params.email;
 	if (params.phone) body.phone = params.phone;
 
-	const res = await fetch(`${BASE_URL}/api/v2/verify-otp`, {
+	const res = await fetchWithTimeout(`${BASE_URL}/api/v2/verify-otp`, {
 		method: "POST",
 		headers: {
 			Accept: "application/json",

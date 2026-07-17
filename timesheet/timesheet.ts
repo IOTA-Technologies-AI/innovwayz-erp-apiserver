@@ -715,8 +715,21 @@ export const requestPortalOtp = api(
 			return { ok: true, channel, target: maskTarget(emp.mobile_number ?? mobile) };
 		} catch (err) {
 			if (err instanceof APIError) throw err;
-			log.error("portal otp send failed", { error: String(err) });
-			throw APIError.unavailable("could not send the verification code — please try again");
+			const msg = err instanceof Error ? err.message : String(err);
+			log.error("portal otp send failed", { channel, error: msg });
+			if (msg.includes("not configured")) {
+				throw APIError.unavailable(
+					"the SMS/OTP service is not configured yet — please contact your administrator",
+				);
+			}
+			if (msg.includes("timed out")) {
+				throw APIError.deadlineExceeded(
+					"the verification service did not respond in time — please try again",
+				);
+			}
+			throw APIError.unavailable(
+				"could not send the verification code — please try again",
+			);
 		}
 	},
 );
