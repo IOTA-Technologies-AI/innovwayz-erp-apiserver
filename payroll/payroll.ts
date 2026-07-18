@@ -2,7 +2,7 @@ import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
 import { CronJob } from "encore.dev/cron";
-import { user, billing } from "~encore/clients";
+import { user, billing, financial } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
 
@@ -39,6 +39,7 @@ export interface SalaryPayment {
 	currency: string;
 	notes: string | null;
 	payment_method: string | null;
+	salary_account: string;
 	status: SalaryStatus;
 	created_by: string;
 	created_by_name: string | null;
@@ -72,10 +73,24 @@ function isFinance(role: string): boolean {
 	return ["finance", "super_admin"].includes(role);
 }
 
+// ─── Ledger posting (Corp Finance) ────────────────────────────────────────────
+// Paid salaries post cash-basis: Dr <salary_account> / Cr 11100 Cash. Placed
+// resources (assigned to a client) are a direct delivery cost — 51100 (COGS);
+// internal/management staff are OPEX — 52100. One cumulative entry per account
+// per pay batch, never per employee.
+const SALARY_CASH_ACCOUNT = "11100";
+const PLACED_SALARY_ACCOUNT = "51100"; // Contracted Resource Monthly Payroll
+const INTERNAL_SALARY_ACCOUNT = "52100"; // Executive Staff Salaries
+
+/** A placed resource (has a client) → COGS 51100; otherwise OPEX 52100. */
+function salaryAccountFor(customerId: string | null | undefined): string {
+	return customerId ? PLACED_SALARY_ACCOUNT : INTERNAL_SALARY_ACCOUNT;
+}
+
 const SALARY_COLUMNS = `
   id, reference, employee_id, employee_name, position, customer_id, customer_name,
   period_month, period_year, base_amount, additions, deductions, net_amount,
-  currency, notes, payment_method, status,
+  currency, notes, payment_method, salary_account, status,
   created_by, created_by_name,
   manager_approved_by, manager_approved_at, admin_approved_by, admin_approved_at,
   rejected_by, rejected_at, rejection_reason,
@@ -226,6 +241,95 @@ function computeNet(base: number, additions: number, deductions: number) {
 	return Math.round((base + additions - deductions) * 100) / 100;
 }
 
+const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+const periodKey = (m: number, y: number) => `${y}-${String(m).padStart(2, "0")}`;
+const newBatchRef = () => `SALPAY-${crypto.randomUUID()}`;
+
+/** Mark one salary row paid and stamp its ledger batch reference. */
+async function markSalaryPaidRow(
+	salaryId: string,
+	paidAmount: number,
+	paymentRef: string | null,
+	batchRef: string,
+	userID: string,
+	actorName: string | null,
+): Promise<void> {
+	await db.exec`
+    UPDATE salary_payments SET
+      status = 'paid', processed_by = ${userID}, processed_at = NOW(), paid_at = NOW(),
+      payment_reference = ${paymentRef}, paid_amount = ${paidAmount},
+      pay_batch_ref = ${batchRef}, updated_at = NOW()
+    WHERE id = ${salaryId}
+  `;
+	await logEvent(salaryId, "paid", userID, actorName, paymentRef ?? undefined);
+}
+
+interface PaidRow {
+	salary_account: string;
+	paid: number;
+	period_month: number;
+	period_year: number;
+}
+
+/**
+ * Post the cumulative salary ledger entry(ies) for a batch of just-paid rows:
+ * one Dr <salary_account> / Cr 11100 Cash entry per distinct account, summing
+ * the paid amounts — never per employee. Best-effort per account; a posting
+ * failure is logged and the reconcile endpoint can backfill it later.
+ */
+async function postSalaryBatch(
+	rows: PaidRow[],
+	batchRef: string,
+	userID: string,
+	actorName: string | null,
+): Promise<{ posted: number; amount: number }> {
+	const byAccount = new Map<
+		string,
+		{ total: number; count: number; periods: Set<string> }
+	>();
+	for (const r of rows) {
+		const g = byAccount.get(r.salary_account) ?? {
+			total: 0,
+			count: 0,
+			periods: new Set<string>(),
+		};
+		g.total = round2(g.total + Number(r.paid));
+		g.count++;
+		g.periods.add(periodKey(r.period_month, r.period_year));
+		byAccount.set(r.salary_account, g);
+	}
+
+	let posted = 0;
+	let amount = 0;
+	for (const [account, g] of byAccount) {
+		if (g.total <= 0) continue;
+		const periods = [...g.periods].sort((a, b) => a.localeCompare(b));
+		const fiscalPeriod =
+			periods.length === 1 ? periods[0] : new Date().toISOString().slice(0, 7);
+		try {
+			await financial.recordAutoEntry({
+				fiscal_period: fiscalPeriod,
+				reference_source: `${batchRef}:${account}`,
+				description: `Salary paid — ${periods.join(", ")} — ${g.count} employee${g.count === 1 ? "" : "s"}`,
+				debit_account: account,
+				credit_account: SALARY_CASH_ACCOUNT,
+				amount: g.total,
+				actor_id: userID,
+				actor_name: actorName,
+			});
+			posted++;
+			amount = round2(amount + g.total);
+		} catch (err) {
+			log.warn("salary batch ledger posting failed", {
+				batchRef,
+				account,
+				error: String(err),
+			});
+		}
+	}
+	return { posted, amount };
+}
+
 // ─── Create a single salary payment ───────────────────────────────────────────
 
 interface CreateSalaryRequest {
@@ -267,6 +371,7 @@ export const createSalaryPayment = api(
 		const additions = req.additions ?? 0;
 		const deductions = req.deductions ?? 0;
 		const net = computeNet(req.base_amount, additions, deductions);
+		const account = salaryAccountFor(req.customer_id);
 
 		const creatorName = await actorNameOf(userID);
 		const id = crypto.randomUUID();
@@ -277,12 +382,12 @@ export const createSalaryPayment = api(
         INSERT INTO salary_payments (
           id, reference, employee_id, employee_name, position, customer_id, customer_name,
           period_month, period_year, base_amount, additions, deductions, net_amount,
-          currency, notes, payment_method, status, created_by, created_by_name
+          currency, notes, payment_method, salary_account, status, created_by, created_by_name
         ) VALUES (
           ${id}, ${reference}, ${req.employee_id}, ${req.employee_name}, ${req.position ?? null},
           ${req.customer_id ?? null}, ${req.customer_name ?? null},
           ${req.period_month}, ${req.period_year}, ${req.base_amount}, ${additions}, ${deductions}, ${net},
-          ${req.currency ?? "SAR"}, ${req.notes ?? null}, ${req.payment_method ?? null},
+          ${req.currency ?? "SAR"}, ${req.notes ?? null}, ${req.payment_method ?? null}, ${account},
           'pending_manager', ${userID}, ${creatorName}
         )
       `;
@@ -316,6 +421,8 @@ export const createSalaryPayment = api(
 interface GenerateMonthlyRequest {
 	period_month: number;
 	period_year: number;
+	/** Optional subset of employees to include in this run (omit = all). */
+	employee_ids?: string[];
 }
 
 interface GenerateMonthlyResponse {
@@ -334,14 +441,21 @@ async function generateForPeriod(
 	periodYear: number,
 	userID: string,
 	creatorName: string | null,
+	employeeIds?: string[],
 ): Promise<GenerateMonthlyResponse> {
 	const { employees } = await billing.listEmployees();
+
+	// Partial run: restrict to the selected employees when a list is provided.
+	const selected = employeeIds && employeeIds.length > 0
+		? new Set(employeeIds)
+		: null;
 
 	let created = 0;
 	let skipped = 0;
 	let totalNet = 0;
 
 	for (const e of employees) {
+		if (selected && !selected.has(e.id)) continue;
 		const base = Number(e.monthly_salary) || 0;
 		if (base <= 0) {
 			skipped++;
@@ -350,19 +464,20 @@ async function generateForPeriod(
 		const id = crypto.randomUUID();
 		const reference = await nextReference();
 		const net = computeNet(base, 0, 0);
+		const account = salaryAccountFor(e.customer_id);
 		const res = await db.rawQueryRow<{ id: string }>(
 			`INSERT INTO salary_payments (
         id, reference, employee_id, employee_name, position, customer_id, customer_name,
         period_month, period_year, base_amount, additions, deductions, net_amount,
-        currency, status, created_by, created_by_name
+        currency, salary_account, status, created_by, created_by_name
       ) VALUES (
-        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, 'SAR', 'draft', $12, $13
+        $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 0, 0, $11, 'SAR', $12, 'draft', $13, $14
       )
       ON CONFLICT (employee_id, period_month, period_year) DO NOTHING
       RETURNING id`,
 			id, reference, e.id, e.name, e.position ?? null,
 			e.customer_id ?? null, e.customer_name ?? null,
-			periodMonth, periodYear, base, net, userID, creatorName,
+			periodMonth, periodYear, base, net, account, userID, creatorName,
 		);
 		if (res) {
 			created++;
@@ -411,7 +526,13 @@ export const generateMonthlyPayroll = api(
 			throw APIError.invalidArgument("a valid period month/year is required");
 
 		const creatorName = await actorNameOf(userID);
-		return generateForPeriod(req.period_month, req.period_year, userID, creatorName);
+		return generateForPeriod(
+			req.period_month,
+			req.period_year,
+			userID,
+			creatorName,
+			req.employee_ids,
+		);
 	},
 );
 
@@ -508,6 +629,9 @@ interface UpdateSalaryRequest {
 	deductions?: number;
 	notes?: string | null;
 	payment_method?: string | null;
+	salary_account?: string;
+	/** Required when the payable amount changes — captured in the audit trail. */
+	reason?: string;
 }
 
 export const updateSalaryPayment = api(
@@ -531,6 +655,30 @@ export const updateSalaryPayment = api(
 		const additions = req.additions ?? Number(current.additions);
 		const deductions = req.deductions ?? Number(current.deductions);
 		const net = computeNet(base, additions, deductions);
+		const prevNet = Number(current.net_amount);
+
+		// A change to the payable amount must carry a reason (audit requirement).
+		const amountChanged =
+			base !== Number(current.base_amount) ||
+			additions !== Number(current.additions) ||
+			deductions !== Number(current.deductions);
+		if (amountChanged && !req.reason?.trim())
+			throw APIError.invalidArgument(
+				"a reason is required when changing the payable salary",
+			);
+
+		let account = current.salary_account;
+		if (req.salary_account !== undefined) {
+			if (
+				![PLACED_SALARY_ACCOUNT, INTERNAL_SALARY_ACCOUNT].includes(
+					req.salary_account,
+				)
+			)
+				throw APIError.invalidArgument(
+					`salary_account must be ${PLACED_SALARY_ACCOUNT} or ${INTERNAL_SALARY_ACCOUNT}`,
+				);
+			account = req.salary_account;
+		}
 
 		await db.exec`
       UPDATE salary_payments SET
@@ -540,10 +688,21 @@ export const updateSalaryPayment = api(
         net_amount     = ${net},
         notes          = ${req.notes !== undefined ? req.notes : current.notes},
         payment_method = ${req.payment_method !== undefined ? req.payment_method : current.payment_method},
+        salary_account = ${account},
         updated_at     = NOW()
       WHERE id = ${id}
     `;
-		await logEvent(id, "updated", userID, current.created_by_name);
+		if (amountChanged) {
+			await logEvent(
+				id,
+				"amount_amended",
+				userID,
+				current.created_by_name,
+				`${SAR(prevNet)} → ${SAR(net)} — ${req.reason!.trim()}`,
+			);
+		} else {
+			await logEvent(id, "updated", userID, current.created_by_name);
+		}
 		return fetchSalary(id);
 	},
 );
@@ -611,11 +770,13 @@ export const approveSalaryPayment = api(
 		base_amount,
 		additions,
 		deductions,
+		reason,
 	}: {
 		id: string;
 		base_amount?: number;
 		additions?: number;
 		deductions?: number;
+		reason?: string;
 	}): Promise<SalaryPayment> => {
 		const { userID, role } = getAuthData()!;
 		let s = await fetchSalary(id);
@@ -634,6 +795,10 @@ export const approveSalaryPayment = api(
 				throw APIError.invalidArgument("amounts must be positive");
 			const net = computeNet(base, add, ded);
 			if (net !== Number(s.net_amount)) {
+				if (!reason?.trim())
+					throw APIError.invalidArgument(
+						"a reason is required when amending the payable salary",
+					);
 				const prev = Number(s.net_amount);
 				await db.exec`
           UPDATE salary_payments SET
@@ -646,7 +811,7 @@ export const approveSalaryPayment = api(
 					"amount_amended",
 					userID,
 					actorName,
-					`${SAR(prev)} → ${SAR(net)}`,
+					`${SAR(prev)} → ${SAR(net)} — ${reason.trim()}`,
 				);
 				s = await fetchSalary(id);
 			}
@@ -792,23 +957,28 @@ export const processSalaryPayment = api(
 					"salary must be approved or processing to mark paid",
 				);
 			const paid = paid_amount ?? Number(s.net_amount);
-			await db.exec`
-        UPDATE salary_payments SET
-          status = 'paid',
-          processed_by = ${userID},
-          processed_at = NOW(),
-          paid_at = NOW(),
-          payment_reference = ${payment_reference ?? null},
-          paid_amount = ${paid},
-          updated_at = NOW()
-        WHERE id = ${id}
-      `;
-			await logEvent(
+			// Mark paid and post the cumulative salary entry (a batch of one).
+			const batchRef = newBatchRef();
+			await markSalaryPaidRow(
 				id,
-				"paid",
+				paid,
+				payment_reference ?? null,
+				batchRef,
 				userID,
 				actorName,
-				payment_reference ?? undefined,
+			);
+			await postSalaryBatch(
+				[
+					{
+						salary_account: s.salary_account,
+						paid,
+						period_month: s.period_month,
+						period_year: s.period_year,
+					},
+				],
+				batchRef,
+				userID,
+				actorName,
 			);
 			const updated = await fetchSalary(id);
 			void notifyUser(
@@ -828,6 +998,146 @@ export const processSalaryPayment = api(
 		}
 
 		throw APIError.invalidArgument("action must be 'start' or 'pay'");
+	},
+);
+
+// ─── Bulk mark paid (multi-select) + cumulative ledger posting ────────────────
+
+interface PayBatchRequest {
+	ids: string[];
+	payment_reference?: string;
+}
+interface PayBatchResponse {
+	paid: number;
+	skipped: number;
+	posted: number;
+	amount: number;
+}
+
+export const payBatch = api(
+	{ expose: true, auth: true, method: "POST", path: "/payroll/pay-batch" },
+	async (req: PayBatchRequest): Promise<PayBatchResponse> => {
+		const { userID, role } = getAuthData()!;
+		if (!isFinance(role))
+			throw APIError.permissionDenied("only finance can process salaries");
+		if (!Array.isArray(req.ids) || req.ids.length === 0)
+			throw APIError.invalidArgument("select at least one salary to pay");
+		const actorName = await actorNameOf(userID);
+		const batchRef = newBatchRef();
+
+		let paidCount = 0;
+		let skipped = 0;
+		const paidRows: PaidRow[] = [];
+		for (const id of req.ids) {
+			const s = await db.rawQueryRow<SalaryPayment>(
+				`SELECT ${SALARY_COLUMNS} FROM salary_payments WHERE id = $1`,
+				id,
+			);
+			// Only approved (or in-progress) salaries can be paid.
+			if (!s || !["approved", "processing"].includes(s.status)) {
+				skipped++;
+				continue;
+			}
+			const paid = Number(s.net_amount);
+			await markSalaryPaidRow(
+				id,
+				paid,
+				req.payment_reference ?? null,
+				batchRef,
+				userID,
+				actorName,
+			);
+			paidRows.push({
+				salary_account: s.salary_account,
+				paid,
+				period_month: s.period_month,
+				period_year: s.period_year,
+			});
+			paidCount++;
+		}
+
+		// One cumulative Dr <account> / Cr 11100 entry per account in the batch.
+		const { posted, amount } = await postSalaryBatch(
+			paidRows,
+			batchRef,
+			userID,
+			actorName,
+		);
+		return { paid: paidCount, skipped, posted, amount };
+	},
+);
+
+// ─── Reconcile paid salaries to the ledger (backfill) ─────────────────────────
+
+interface SalaryReconcileRequest {
+	paid_since?: string; // YYYY-MM-DD, matched on paid_at
+}
+interface SalaryReconcileResponse {
+	checked: number;
+	posted: number;
+	amount: number;
+}
+
+/**
+ * Backfill cumulative ledger entries for paid salaries never posted
+ * (`pay_batch_ref IS NULL`) — e.g. paid before ledger posting existed. Groups
+ * by (period, salary_account) into synthetic per-period batches. Idempotent:
+ * stamped rows are excluded, so repeated runs are safe.
+ */
+export const reconcileSalariesToLedger = api(
+	{ expose: true, auth: true, method: "POST", path: "/payroll/reconcile-ledger" },
+	async (req: SalaryReconcileRequest): Promise<SalaryReconcileResponse> => {
+		const { userID, role } = getAuthData()!;
+		if (!isFinance(role)) throw APIError.permissionDenied("finance only");
+		const actorName = await actorNameOf(userID);
+
+		const rows = db.rawQuery<{
+			id: string;
+			salary_account: string;
+			paid_amount: string | null;
+			net_amount: string;
+			period_month: number;
+			period_year: number;
+		}>(
+			`SELECT id, salary_account, paid_amount::TEXT AS paid_amount,
+			        net_amount::TEXT AS net_amount, period_month, period_year
+			 FROM salary_payments
+			 WHERE status = 'paid' AND pay_batch_ref IS NULL
+			   AND ($1::date IS NULL OR paid_at::date >= $1::date)`,
+			req.paid_since ?? null,
+		);
+
+		const byPeriod = new Map<string, PaidRow[]>();
+		let checked = 0;
+		for await (const r of rows) {
+			checked++;
+			const key = periodKey(r.period_month, r.period_year);
+			const batchRef = `SALRECON-${key}`;
+			// Stamp first so a mid-run failure can never double-post on retry.
+			await db.exec`UPDATE salary_payments SET pay_batch_ref = ${batchRef} WHERE id = ${r.id}`;
+			const list = byPeriod.get(key) ?? [];
+			list.push({
+				salary_account: r.salary_account,
+				paid: round2(Number(r.paid_amount ?? r.net_amount)),
+				period_month: r.period_month,
+				period_year: r.period_year,
+			});
+			byPeriod.set(key, list);
+		}
+
+		let posted = 0;
+		let amount = 0;
+		for (const [key, list] of byPeriod) {
+			const res = await postSalaryBatch(
+				list,
+				`SALRECON-${key}`,
+				userID,
+				actorName,
+			);
+			posted += res.posted;
+			amount = round2(amount + res.amount);
+		}
+		return { checked, posted, amount };
 	},
 );
 
