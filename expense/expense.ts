@@ -84,9 +84,11 @@ function isFinance(role: string): boolean {
 	return ["finance", "super_admin"].includes(role);
 }
 
-// Automatic expense→ledger posting is OFF (see invoice service note). The
-// organisation's books are maintained manually via journal entries.
-const AUTO_POST_TO_LEDGER = false;
+// Cash-basis ledger posting: only PAID expenses post, at payment time, as
+// Dr <expense account> / Cr 11100 Cash. Approved-but-unpaid expenses stay off
+// the books; historical (pre-go-live) expenses are the opening balance and are
+// not backfilled unless explicitly reconciled with a `paid_since` cutoff.
+const EXPENSE_CASH_ACCOUNT = "11100"; // Corporate Operating Account (SAR)
 
 const EXPENSE_COLUMNS = `
   id, reference, category, expense_class, expense_type_code, expense_type_name,
@@ -704,22 +706,9 @@ export const approveExpense = api(
 			await logEvent(id, "admin_approved", userID, actorName);
 			const updated = await fetchExpense(id);
 
-			// ── Accrual: Dr [expense acct] / Cr 21100 A/P (recognise the cost) ──
-			if (AUTO_POST_TO_LEDGER)
-			void financial
-				.recordAutoEntry({
-					fiscal_period: (updated.expense_date ?? new Date().toISOString().slice(0, 10)).slice(0, 7),
-					reference_source: `${updated.reference}:accrue`,
-					description: `Expense approved — ${updated.reference} — ${updated.title}`,
-					debit_account: mapExpenseClassToAccount(updated.expense_class),
-					credit_account: "21100", // Accounts Payable
-					amount: Number(updated.amount),
-					actor_id: userID,
-					actor_name: actorName,
-				})
-				.catch((err: unknown) =>
-					log.warn("auto A/P accrual failed for expense", { id, error: String(err) }),
-				);
+			// Cash-basis: approving an expense does NOT post to the ledger — only
+			// a recorded payment does (see the "pay" action). Approved-but-unpaid
+			// expenses stay off the books until the cash goes out.
 
 			void notifyRoles(
 				["finance", "super_admin"],
@@ -881,26 +870,27 @@ export const processExpense = api(
 			);
 			const updated = await fetchExpense(id);
 
-			// ── Payment: Dr 21100 A/P / Cr 11100 Cash (clears the payable) ──────
+			// ── Cash-basis payment: Dr <expense acct> / Cr 11100 Cash ───────────
+			// Recognise the cost when the cash goes out. Best-effort: a posting
+			// failure must not fail the payment — reconcileExpensesToLedger backfills.
 			const paidAmt = Number(paid_amount ?? e.amount);
-			if (AUTO_POST_TO_LEDGER)
-				void financial
-					.recordAutoEntry({
-						fiscal_period: new Date().toISOString().slice(0, 7),
-						reference_source: `${e.reference}:pay`,
-						description: `Expense paid — ${e.reference} — ${e.title}`,
-						debit_account: "21100", // Accounts Payable (cleared)
-						credit_account: "11100", // Corporate Operating Account (cash out)
-						amount: paidAmt,
-						actor_id: userID,
-						actor_name: actorName,
-					})
-					.catch((err: unknown) =>
-						log.warn("auto cash-payment entry failed for expense", {
-							id,
-							error: String(err),
-						}),
-					);
+			try {
+				await financial.recordAutoEntry({
+					fiscal_period: new Date().toISOString().slice(0, 7),
+					reference_source: `${e.reference}:pay`,
+					description: `Expense paid — ${e.reference} — ${e.title}`,
+					debit_account: mapExpenseClassToAccount(e.expense_class), // the cost
+					credit_account: EXPENSE_CASH_ACCOUNT, // 11100 cash out
+					amount: paidAmt,
+					actor_id: userID,
+					actor_name: actorName,
+				});
+			} catch (err: unknown) {
+				log.warn("cash-basis expense payment posting failed", {
+					id,
+					error: String(err),
+				});
+			}
 
 			void notifyUser(
 				updated.created_by,
@@ -1436,15 +1426,24 @@ interface ExpenseReconcileResult {
 	amount_posted: number;
 }
 
+interface ExpenseReconcileRequest {
+	/**
+	 * Only post expenses paid on/after this date (YYYY-MM-DD), matched against
+	 * `processed_at`. Go-live cutoff: historical expenses (opening balance) are
+	 * left alone. Omit to reconcile every paid expense (not normally desired).
+	 */
+	paid_since?: string;
+}
+
 /**
- * Backfill missing accrual entries for approved/paid expenses: the cost
- * accrual (Dr Expense / Cr A/P) for the approved amount, and the cash payment
- * (Dr A/P / Cr Cash) for the amount actually paid. Idempotent per stage
- * (keyed on `<ref>:accrue` / `<ref>:pay`), so repeated runs are safe.
+ * Cash-basis backfill: for each paid expense's cash outflow not yet on the
+ * ledger, post Dr <expense account> / Cr 11100 Cash. Idempotent — posts only
+ * the difference vs what is already booked for `<ref>:pay`. `paid_since` scopes
+ * it so pre-go-live expenses are never injected.
  */
 export const reconcileExpensesToLedger = api(
 	{ expose: true, auth: true, method: "POST", path: "/expenses/reconcile-ledger" },
-	async (): Promise<ExpenseReconcileResult> => {
+	async (req: ExpenseReconcileRequest): Promise<ExpenseReconcileResult> => {
 		const { userID, role } = getAuthData()!;
 		if (!isFinance(role) && !isManager(role))
 			throw APIError.permissionDenied("finance or admin only");
@@ -1454,18 +1453,21 @@ export const reconcileExpensesToLedger = api(
 		const actorName = contact.name ?? null;
 		const r2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
+		const paidSince = req.paid_since ?? null;
 		const rows = db.rawQuery<{
 			reference: string;
 			title: string;
 			expense_class: string;
-			status: string;
 			amount: string;
 			paid_amount: string | null;
-			expense_date: string | null;
+			processed_at: string | null;
 		}>(
-			`SELECT reference, title, expense_class, status, amount::TEXT AS amount,
-			        paid_amount::TEXT AS paid_amount, expense_date::TEXT AS expense_date
-			 FROM expenses WHERE status IN ('approved','processing','paid')`,
+			`SELECT reference, title, expense_class, amount::TEXT AS amount,
+			        paid_amount::TEXT AS paid_amount, processed_at::TEXT AS processed_at
+			 FROM expenses
+			 WHERE status = 'paid'
+			   AND ($1::date IS NULL OR processed_at::date >= $1::date)`,
+			paidSince,
 		);
 
 		const today = new Date().toISOString().slice(0, 10);
@@ -1474,60 +1476,29 @@ export const reconcileExpensesToLedger = api(
 		let amountPosted = 0;
 		for await (const e of rows) {
 			checked++;
-			const period = (e.expense_date ?? today).slice(0, 7);
-			// 1. Cost accrual (Dr Expense / Cr A/P) for the approved amount.
-			const amount = r2(Number(e.amount ?? 0));
-			if (amount > 0) {
-				const accrued = await financial.postedAmountForSource({
-					source_ref: `${e.reference}:accrue`,
-				});
-				const accrueDiff = r2(amount - Number(accrued.debit));
-				if (accrueDiff > 0.005) {
-					try {
-						await financial.recordAutoEntry({
-							fiscal_period: period,
-							reference_source: `${e.reference}:accrue`,
-							description: `Expense approved (reconciled) — ${e.reference} — ${e.title}`,
-							debit_account: mapExpenseClassToAccount(e.expense_class),
-							credit_account: "21100",
-							amount: accrueDiff,
-							actor_id: userID,
-							actor_name: actorName,
-						});
-						posted++;
-						amountPosted = r2(amountPosted + accrueDiff);
-					} catch (err) {
-						log.warn("expense accrual reconcile failed", { reference: e.reference, error: String(err) });
-					}
-				}
-			}
-
-			// 2. Cash payment (Dr A/P / Cr Cash) for the amount actually paid.
-			if (e.status === "paid") {
-				const paid = r2(Number(e.paid_amount ?? e.amount));
-				if (paid > 0) {
-					const settled = await financial.postedAmountForSource({
-						source_ref: `${e.reference}:pay`,
+			// Cash payment (Dr Expense / Cr Cash) for the amount actually paid.
+			const paid = r2(Number(e.paid_amount ?? e.amount));
+			if (paid <= 0) continue;
+			const settled = await financial.postedAmountForSource({
+				source_ref: `${e.reference}:pay`,
+			});
+			const payDiff = r2(paid - Number(settled.debit));
+			if (payDiff > 0.005) {
+				try {
+					await financial.recordAutoEntry({
+						fiscal_period: (e.processed_at ?? today).slice(0, 7),
+						reference_source: `${e.reference}:pay`,
+						description: `Expense paid (reconciled) — ${e.reference} — ${e.title}`,
+						debit_account: mapExpenseClassToAccount(e.expense_class),
+						credit_account: EXPENSE_CASH_ACCOUNT,
+						amount: payDiff,
+						actor_id: userID,
+						actor_name: actorName,
 					});
-					const payDiff = r2(paid - Number(settled.debit));
-					if (payDiff > 0.005) {
-						try {
-							await financial.recordAutoEntry({
-								fiscal_period: period,
-								reference_source: `${e.reference}:pay`,
-								description: `Expense paid (reconciled) — ${e.reference} — ${e.title}`,
-								debit_account: "21100",
-								credit_account: "11100",
-								amount: payDiff,
-								actor_id: userID,
-								actor_name: actorName,
-							});
-							posted++;
-							amountPosted = r2(amountPosted + payDiff);
-						} catch (err) {
-							log.warn("expense payment reconcile failed", { reference: e.reference, error: String(err) });
-						}
-					}
+					posted++;
+					amountPosted = r2(amountPosted + payDiff);
+				} catch (err) {
+					log.warn("expense payment reconcile failed", { reference: e.reference, error: String(err) });
 				}
 			}
 		}

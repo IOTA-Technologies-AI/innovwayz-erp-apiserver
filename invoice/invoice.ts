@@ -32,6 +32,7 @@ export interface Invoice {
 	amount: number;
 	total_amount: number;
 	currency: string;
+	revenue_account: string;
 	status: InvoiceStatus;
 	issue_date: string | null;
 	due_date: string | null;
@@ -64,7 +65,7 @@ function canManage(role: string): boolean {
 const INVOICE_COLUMNS = `
   id, reference, customer_id, customer_name, employee_id, employee_name,
   period_month, period_year, description,
-  amount, total_amount, currency, status,
+  amount, total_amount, currency, revenue_account, status,
   issue_date, due_date, paid_date, paid_amount, payment_reference, notes,
   created_by, created_by_name, sent_by, sent_at, cancelled_by, cancelled_at,
   created_at, updated_at
@@ -174,11 +175,23 @@ function addDays(dateStr: string, days: number): string {
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-// Automatic invoice→ledger posting is OFF. The organisation's books are the
-// manually-maintained ledger (seed + manual journal entries); auto-posting
-// operational invoices polluted the real bank balance. Flip to true only if
-// invoice data represents the actual books of account.
-const AUTO_POST_TO_LEDGER = false;
+// ── Cash-basis ledger posting (Corp Finance) ─────────────────────────────────
+// Only PAID invoices post, at payment time, as Dr 11100 Cash / Cr <revenue>.
+// No A/R accrual on send — the manually-maintained ledger is the opening
+// balance and historical (already-paid) invoices are NOT backfilled.
+const CASH_ACCOUNT = "11100"; // Corporate Operating Account (SAR)
+const REVENUE_ACCOUNTS = ["41100", "41200", "41300"] as const;
+const DEFAULT_REVENUE_ACCOUNT = "41100";
+
+/** Validate a caller-supplied revenue account; default when omitted. */
+function resolveRevenueAccount(v: string | undefined): string {
+	if (v == null || v === "") return DEFAULT_REVENUE_ACCOUNT;
+	if (!(REVENUE_ACCOUNTS as readonly string[]).includes(v))
+		throw APIError.invalidArgument(
+			`revenue_account must be one of ${REVENUE_ACCOUNTS.join(", ")}`,
+		);
+	return v;
+}
 
 // ─── Create ───────────────────────────────────────────────────────────────────
 
@@ -192,6 +205,7 @@ interface CreateInvoiceRequest {
 	description?: string;
 	amount: number;
 	currency?: string;
+	revenue_account?: string;
 	issue_date?: string;
 	due_date?: string;
 	notes?: string;
@@ -212,6 +226,7 @@ export const createInvoice = api(
 
 		const amount = round2(Number(req.amount));
 		const total = amount; // No tax/VAT — total always equals the net amount.
+		const revenueAccount = resolveRevenueAccount(req.revenue_account);
 		const id = crypto.randomUUID();
 		const reference = await nextReference();
 		const contact = await user
@@ -222,13 +237,13 @@ export const createInvoice = api(
       INSERT INTO invoices (
         id, reference, customer_id, customer_name, employee_id, employee_name,
         period_month, period_year, description,
-        amount, total_amount, currency, status,
+        amount, total_amount, currency, revenue_account, status,
         issue_date, due_date, notes, created_by, created_by_name
       ) VALUES (
         ${id}, ${reference}, ${req.customer_id ?? null}, ${req.customer_name},
         ${req.employee_id ?? null}, ${req.employee_name ?? null},
         ${req.period_month ?? null}, ${req.period_year ?? null}, ${req.description ?? null},
-        ${amount}, ${total}, ${req.currency ?? "SAR"}, 'draft',
+        ${amount}, ${total}, ${req.currency ?? "SAR"}, ${revenueAccount}, 'draft',
         ${req.issue_date ?? null}, ${req.due_date ?? null}, ${req.notes ?? null},
         ${userID}, ${contact.name ?? null}
       )
@@ -468,6 +483,7 @@ interface UpdateInvoiceRequest {
 	period_year?: number | null;
 	description?: string | null;
 	amount?: number;
+	revenue_account?: string;
 	issue_date?: string | null;
 	due_date?: string | null;
 	notes?: string | null;
@@ -489,6 +505,10 @@ export const updateInvoice = api(
 
 		const amount = req.amount != null ? round2(Number(req.amount)) : inv.amount;
 		const total = amount; // No tax/VAT — total always equals the net amount.
+		const revenueAccount =
+			req.revenue_account !== undefined
+				? resolveRevenueAccount(req.revenue_account)
+				: inv.revenue_account;
 
 		await db.exec`
       UPDATE invoices SET
@@ -501,6 +521,7 @@ export const updateInvoice = api(
         description   = ${req.description !== undefined ? req.description : inv.description},
         amount        = ${amount},
         total_amount  = ${total},
+        revenue_account = ${revenueAccount},
         issue_date    = ${req.issue_date !== undefined ? req.issue_date : inv.issue_date},
         due_date      = ${req.due_date !== undefined ? req.due_date : inv.due_date},
         notes         = ${req.notes !== undefined ? req.notes : inv.notes},
@@ -568,26 +589,9 @@ export const sendInvoice = api(
 			.catch(() => ({ name: null as string | null }));
 		await logEvent(req.id, "sent", userID, contact.name ?? null);
 
-		// ── Accrual entry: Dr 11300 A/R / Cr 41100 Revenue (recognise billing) ──
-		if (AUTO_POST_TO_LEDGER && inv.status === "draft") {
-			void financial
-				.recordAutoEntry({
-					fiscal_period: issue.slice(0, 7),
-					reference_source: `${inv.reference}:bill`,
-					description: `Invoice issued — ${inv.reference} — ${inv.customer_name}`,
-					debit_account: "11300", // Accounts Receivable
-					credit_account: "41100", // Revenue
-					amount: round2(Number(inv.total_amount)),
-					actor_id: userID,
-					actor_name: contact.name ?? null,
-				})
-				.catch((e) =>
-					log.warn("auto A/R entry failed for invoice", {
-						id: req.id,
-						error: String(e),
-					}),
-				);
-		}
+		// Cash-basis: issuing an invoice does NOT post to the ledger — only a
+		// recorded payment does (see payInvoice). Sent/overdue invoices stay off
+		// the books until the cash is received.
 
 		const updated = await fetchInvoice(req.id);
 		await notifyRoles(
@@ -656,25 +660,27 @@ export const payInvoice = api(
 			`Received ${SAR(increment)} (total paid ${SAR(newPaid)})`,
 		);
 
-		// ── Cash receipt: Dr 11100 Cash / Cr 11300 A/R (clears the receivable) ──
-		if (AUTO_POST_TO_LEDGER) {
-			void financial
-				.recordAutoEntry({
-					fiscal_period: paidDate.slice(0, 7),
-					reference_source: `${inv.reference}:pay`,
-					description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
-					debit_account: "11100", // Corporate Operating Account (cash in)
-					credit_account: "11300", // Accounts Receivable (cleared)
-					amount: increment,
-					actor_id: userID,
-					actor_name: contact.name ?? null,
-				})
-				.catch((e) =>
-					log.warn("auto cash-receipt entry failed for invoice", {
-						id: req.id,
-						error: String(e),
-					}),
-				);
+		// ── Cash-basis receipt: Dr 11100 Cash / Cr <revenue_account> ──────────
+		// Recognise revenue when the cash is received. `increment` is the amount
+		// actually collected on this call, so partial payments post correctly and
+		// never double-count. Best-effort: a posting failure must not fail the
+		// payment — reconcileInvoicesToLedger backfills any gap.
+		try {
+			await financial.recordAutoEntry({
+				fiscal_period: paidDate.slice(0, 7),
+				reference_source: `${inv.reference}:pay`,
+				description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
+				debit_account: CASH_ACCOUNT, // 11100 cash in
+				credit_account: inv.revenue_account, // recognise revenue
+				amount: increment,
+				actor_id: userID,
+				actor_name: contact.name ?? null,
+			});
+		} catch (e) {
+			log.warn("cash-basis invoice payment posting failed", {
+				id: req.id,
+				error: String(e),
+			});
 		}
 
 		return fetchInvoice(req.id);
@@ -809,16 +815,24 @@ interface ReconcileResult {
 	amount_posted: number;
 }
 
+interface ReconcileRequest {
+	/**
+	 * Only post invoices paid on/after this date (YYYY-MM-DD). This is the
+	 * go-live cutoff: historical invoices (the opening balance) are left alone.
+	 * Omit to reconcile every paid invoice (not normally desired).
+	 */
+	paid_since?: string;
+}
+
 /**
- * Backfill missing accrual entries for issued invoices so the ledger reflects
- * both the billing (Dr A/R / Cr Revenue for the invoiced total) and any cash
- * received (Dr Cash / Cr A/R for the paid amount). Idempotent: posts only the
- * difference between the expected amount and what is already on the ledger for
- * each stage (keyed on `<ref>:bill` / `<ref>:pay`), so repeated runs are safe.
+ * Cash-basis backfill: for each invoice's collected cash not yet on the ledger,
+ * post Dr 11100 Cash / Cr <revenue_account>. Idempotent — posts only the
+ * difference vs what is already booked for `<ref>:pay`, so repeated runs are
+ * safe. `paid_since` scopes it so pre-go-live invoices are never injected.
  */
 export const reconcileInvoicesToLedger = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/reconcile-ledger" },
-	async (): Promise<ReconcileResult> => {
+	async (req: ReconcileRequest): Promise<ReconcileResult> => {
 		const { userID, role } = getAuthData()!;
 		if (!isFinance(role) && !isManager(role))
 			throw APIError.permissionDenied("finance or admin only");
@@ -827,18 +841,20 @@ export const reconcileInvoicesToLedger = api(
 			.catch(() => ({ name: null as string | null }));
 		const actorName = contact.name ?? null;
 
+		const paidSince = req.paid_since ?? null;
 		const rows = db.rawQuery<{
 			reference: string;
 			customer_name: string | null;
-			total_amount: string;
+			revenue_account: string;
 			paid_amount: string | null;
-			issue_date: string | null;
 			paid_date: string | null;
 		}>(
-			`SELECT reference, customer_name,
-			        total_amount::TEXT AS total_amount, paid_amount::TEXT AS paid_amount,
-			        issue_date::TEXT AS issue_date, paid_date::TEXT AS paid_date
-			 FROM invoices WHERE status IN ('sent','partially_paid','paid')`,
+			`SELECT reference, customer_name, revenue_account,
+			        paid_amount::TEXT AS paid_amount, paid_date::TEXT AS paid_date
+			 FROM invoices
+			 WHERE paid_amount > 0
+			   AND ($1::date IS NULL OR paid_date >= $1::date)`,
+			paidSince,
 		);
 
 		const today = new Date().toISOString().slice(0, 10);
@@ -847,57 +863,29 @@ export const reconcileInvoicesToLedger = api(
 		let amountPosted = 0;
 		for await (const inv of rows) {
 			checked++;
-			// 1. Billing accrual (Dr A/R / Cr Revenue) for the invoiced total.
-			const total = round2(Number(inv.total_amount ?? 0));
-			if (total > 0) {
-				const billed = await financial.postedAmountForSource({
-					source_ref: `${inv.reference}:bill`,
-				});
-				const billDiff = round2(total - Number(billed.credit));
-				if (billDiff > 0.005) {
-					try {
-						await financial.recordAutoEntry({
-							fiscal_period: (inv.issue_date ?? today).slice(0, 7),
-							reference_source: `${inv.reference}:bill`,
-							description: `Invoice issued (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
-							debit_account: "11300",
-							credit_account: "41100",
-							amount: billDiff,
-							actor_id: userID,
-							actor_name: actorName,
-						});
-						posted++;
-						amountPosted = round2(amountPosted + billDiff);
-					} catch (err) {
-						log.warn("invoice billing reconcile failed", { reference: inv.reference, error: String(err) });
-					}
-				}
-			}
-
-			// 2. Cash receipt (Dr Cash / Cr A/R) for the amount actually paid.
+			// Cash receipt (Dr Cash / Cr Revenue) for the amount actually paid.
 			const paid = round2(Number(inv.paid_amount ?? 0));
-			if (paid > 0) {
-				const received = await financial.postedAmountForSource({
-					source_ref: `${inv.reference}:pay`,
-				});
-				const payDiff = round2(paid - Number(received.debit));
-				if (payDiff > 0.005) {
-					try {
-						await financial.recordAutoEntry({
-							fiscal_period: (inv.paid_date ?? today).slice(0, 7),
-							reference_source: `${inv.reference}:pay`,
-							description: `Invoice payment (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
-							debit_account: "11100",
-							credit_account: "11300",
-							amount: payDiff,
-							actor_id: userID,
-							actor_name: actorName,
-						});
-						posted++;
-						amountPosted = round2(amountPosted + payDiff);
-					} catch (err) {
-						log.warn("invoice receipt reconcile failed", { reference: inv.reference, error: String(err) });
-					}
+			if (paid <= 0) continue;
+			const received = await financial.postedAmountForSource({
+				source_ref: `${inv.reference}:pay`,
+			});
+			const payDiff = round2(paid - Number(received.debit));
+			if (payDiff > 0.005) {
+				try {
+					await financial.recordAutoEntry({
+						fiscal_period: (inv.paid_date ?? today).slice(0, 7),
+						reference_source: `${inv.reference}:pay`,
+						description: `Invoice payment (reconciled) — ${inv.reference} — ${inv.customer_name ?? ""}`,
+						debit_account: CASH_ACCOUNT,
+						credit_account: inv.revenue_account,
+						amount: payDiff,
+						actor_id: userID,
+						actor_name: actorName,
+					});
+					posted++;
+					amountPosted = round2(amountPosted + payDiff);
+				} catch (err) {
+					log.warn("invoice receipt reconcile failed", { reference: inv.reference, error: String(err) });
 				}
 			}
 		}
