@@ -28,6 +28,54 @@ function isFinance(role: string): boolean {
 function canManage(role: string): boolean {
 	return ["admin", "super_admin", "finance"].includes(role);
 }
+
+// ─── Period handling ──────────────────────────────────────────────────────────
+// Statements accept a month RANGE via period_start/period_end (both YYYY-MM),
+// with fiscal_period kept as a single-month alias for back-compat. fiscal_period
+// is a zero-padded VARCHAR(7), so string comparison is chronologically correct.
+// Sentinels stand in for an open-ended / all-time range.
+const PERIOD_RE = /^\d{4}-\d{2}$/;
+const MIN_PERIOD = "0000-00";
+const MAX_PERIOD = "9999-99";
+
+interface PeriodRangeInput {
+	fiscal_period?: string;
+	period_start?: string;
+	period_end?: string;
+}
+
+function validPeriod(p: string, field: string): string {
+	if (!PERIOD_RE.test(p))
+		throw APIError.invalidArgument(`${field} must be in YYYY-MM format`);
+	return p;
+}
+
+/**
+ * Resolve a request's period into a `{start, end}` month range (YYYY-MM).
+ * Falls back from period_start/period_end → fiscal_period → sentinels. When
+ * `required` is set (flow statements), a concrete period must be supplied.
+ */
+function resolveRange(
+	req: PeriodRangeInput,
+	opts: { required?: boolean } = {},
+): { start: string; end: string } {
+	const startRaw = req.period_start ?? req.fiscal_period;
+	const endRaw = req.period_end ?? req.fiscal_period;
+	if (opts.required && (!startRaw || !endRaw))
+		throw APIError.invalidArgument(
+			"a period is required (fiscal_period, or period_start + period_end)",
+		);
+	const start = startRaw ? validPeriod(startRaw, "period_start") : MIN_PERIOD;
+	const end = endRaw ? validPeriod(endRaw, "period_end") : MAX_PERIOD;
+	if (start > end)
+		throw APIError.invalidArgument("period_start must be on or before period_end");
+	return { start, end };
+}
+
+/** Human label for a resolved range: "2026-07" or "2026-04 → 2026-06". */
+function periodLabel(start: string, end: string): string {
+	return start === end ? start : `${start} → ${end}`;
+}
 function isAdmin(role: string): boolean {
 	return ["admin", "super_admin"].includes(role);
 }
@@ -142,6 +190,8 @@ export interface TrialBalanceLine {
 
 export interface TrialBalanceResult {
 	period: string | null;
+	period_start: string | null;
+	period_end: string | null;
 	lines: TrialBalanceLine[];
 	grand_total_debit: number;
 	grand_total_credit: number;
@@ -156,7 +206,9 @@ export interface PnLLine {
 }
 
 export interface PnLResult {
-	period: string;
+	period: string; // display label (start, or "start→end" for a range)
+	period_start: string;
+	period_end: string;
 	revenue_lines: PnLLine[];
 	cogs_lines: PnLLine[];
 	opex_lines: PnLLine[];
@@ -212,6 +264,8 @@ export interface PartnerDisbursement {
 
 export interface DisbursementResult {
 	period: string;
+	period_start: string;
+	period_end: string;
 	gross_revenue: number;
 	net_profit: number;
 	retained_earnings_20pct: number;
@@ -520,47 +574,33 @@ export const listJournalEntries = api(
 	},
 	async (req: {
 		fiscal_period?: string;
+		period_start?: string;
+		period_end?: string;
 		limit?: number;
 		offset?: number;
 	}): Promise<{ journal_entries: JournalEntry[]; total: number }> => {
 		const limit = Math.min(req.limit ?? 50, 200);
 		const offset = req.offset ?? 0;
+		// Range filter (sentinels ⇒ all entries). fiscal_period still works as a
+		// single-month filter via resolveRange's fallback.
+		const { start, end } = resolveRange(req);
 
-		let journal_entries: JournalEntry[];
-		let total = 0;
+		const countRow = await db.queryRow<{ count: number }>`
+      SELECT COUNT(*)::int AS count FROM journal_entries
+      WHERE fiscal_period BETWEEN ${start} AND ${end}
+    `;
+		const total = countRow?.count ?? 0;
 
-		if (req.fiscal_period) {
-			const countRow = await db.queryRow<{ count: number }>`
-        SELECT COUNT(*)::int AS count FROM journal_entries WHERE fiscal_period = ${req.fiscal_period}
-      `;
-			total = countRow?.count ?? 0;
-
-			const rows = db.query<JournalEntry>`
-        SELECT id, reference, fiscal_period, description, is_posted, posted_at, posted_by,
-               posted_by_name, is_locked, created_by, created_by_name, created_at, updated_at
-        FROM journal_entries
-        WHERE fiscal_period = ${req.fiscal_period}
-        ORDER BY created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
-			journal_entries = [];
-			for await (const row of rows) journal_entries.push(row);
-		} else {
-			const countRow = await db.queryRow<{ count: number }>`
-        SELECT COUNT(*)::int AS count FROM journal_entries
-      `;
-			total = countRow?.count ?? 0;
-
-			const rows = db.query<JournalEntry>`
-        SELECT id, reference, fiscal_period, description, is_posted, posted_at, posted_by,
-               posted_by_name, is_locked, created_by, created_by_name, created_at, updated_at
-        FROM journal_entries
-        ORDER BY fiscal_period DESC, created_at DESC
-        LIMIT ${limit} OFFSET ${offset}
-      `;
-			journal_entries = [];
-			for await (const row of rows) journal_entries.push(row);
-		}
+		const rows = db.query<JournalEntry>`
+      SELECT id, reference, fiscal_period, description, is_posted, posted_at, posted_by,
+             posted_by_name, is_locked, created_by, created_by_name, created_at, updated_at
+      FROM journal_entries
+      WHERE fiscal_period BETWEEN ${start} AND ${end}
+      ORDER BY fiscal_period DESC, created_at DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `;
+		const journal_entries: JournalEntry[] = [];
+		for await (const row of rows) journal_entries.push(row);
 
 		return { journal_entries, total };
 	},
@@ -844,55 +884,45 @@ async function collectLines(entryId: string): Promise<LedgerLine[]> {
 
 export const getTrialBalance = api(
 	{ expose: true, auth: true, method: "GET", path: "/financial/trial-balance" },
-	async (req: { fiscal_period?: string }): Promise<TrialBalanceResult> => {
-		let lines: TrialBalanceLine[];
+	async (
+		req: {
+			fiscal_period?: string;
+			period_start?: string;
+			period_end?: string;
+		},
+	): Promise<TrialBalanceResult> => {
+		// Movement (debits/credits) across the range; sentinels ⇒ all-time.
+		const { start, end } = resolveRange(req);
+		const allTime = start === MIN_PERIOD && end === MAX_PERIOD;
 
-		if (req.fiscal_period) {
-			const rows = db.query<TrialBalanceLine>`
-        SELECT
-          coa.account_code,
-          coa.account_name,
-          coa.account_class,
-          COALESCE(SUM(ll.debit), 0.00)   AS total_debit,
-          COALESCE(SUM(ll.credit), 0.00)  AS total_credit
-        FROM chart_of_accounts coa
-        LEFT JOIN ledger_lines ll ON coa.account_code = ll.account_code
-        LEFT JOIN journal_entries je ON ll.journal_entry_id = je.id
-          AND je.is_posted = TRUE
-          AND je.fiscal_period = ${req.fiscal_period}
-        WHERE coa.is_active = TRUE
-        GROUP BY coa.account_code, coa.account_name, coa.account_class
-        HAVING COALESCE(SUM(ll.debit), 0) > 0 OR COALESCE(SUM(ll.credit), 0) > 0
-        ORDER BY coa.account_code
-      `;
-			lines = [];
-			for await (const row of rows) lines.push(row);
-		} else {
-			const rows = db.query<TrialBalanceLine>`
-        SELECT
-          coa.account_code,
-          coa.account_name,
-          coa.account_class,
-          COALESCE(SUM(ll.debit), 0.00)   AS total_debit,
-          COALESCE(SUM(ll.credit), 0.00)  AS total_credit
-        FROM chart_of_accounts coa
-        LEFT JOIN ledger_lines ll ON coa.account_code = ll.account_code
-        LEFT JOIN journal_entries je ON ll.journal_entry_id = je.id AND je.is_posted = TRUE
-        WHERE coa.is_active = TRUE
-        GROUP BY coa.account_code, coa.account_name, coa.account_class
-        HAVING COALESCE(SUM(ll.debit), 0) > 0 OR COALESCE(SUM(ll.credit), 0) > 0
-        ORDER BY coa.account_code
-      `;
-			lines = [];
-			for await (const row of rows) lines.push(row);
-		}
+		const rows = db.query<TrialBalanceLine>`
+      SELECT
+        coa.account_code,
+        coa.account_name,
+        coa.account_class,
+        COALESCE(SUM(ll.debit), 0.00)   AS total_debit,
+        COALESCE(SUM(ll.credit), 0.00)  AS total_credit
+      FROM chart_of_accounts coa
+      LEFT JOIN ledger_lines ll ON coa.account_code = ll.account_code
+      LEFT JOIN journal_entries je ON ll.journal_entry_id = je.id
+        AND je.is_posted = TRUE
+        AND je.fiscal_period BETWEEN ${start} AND ${end}
+      WHERE coa.is_active = TRUE
+      GROUP BY coa.account_code, coa.account_name, coa.account_class
+      HAVING COALESCE(SUM(ll.debit), 0) > 0 OR COALESCE(SUM(ll.credit), 0) > 0
+      ORDER BY coa.account_code
+    `;
+		const lines: TrialBalanceLine[] = [];
+		for await (const row of rows) lines.push(row);
 
 		const grandDebit = lines.reduce((s, l) => s + Number(l.total_debit), 0);
 		const grandCredit = lines.reduce((s, l) => s + Number(l.total_credit), 0);
 		const delta = Math.abs(grandDebit - grandCredit);
 
 		return {
-			period: req.fiscal_period ?? null,
+			period: allTime ? null : periodLabel(start, end),
+			period_start: allTime ? null : start,
+			period_end: allTime ? null : end,
 			lines,
 			grand_total_debit: grandDebit,
 			grand_total_credit: grandCredit,
@@ -906,12 +936,16 @@ export const getTrialBalance = api(
 
 export const getProfitAndLoss = api(
 	{ expose: true, auth: true, method: "GET", path: "/financial/profit-loss" },
-	async (req: { fiscal_period: string }): Promise<PnLResult> => {
-		if (!/^\d{4}-\d{2}$/.test(req.fiscal_period)) {
-			throw APIError.invalidArgument("fiscal_period must be in YYYY-MM format");
-		}
+	async (
+		req: {
+			fiscal_period?: string;
+			period_start?: string;
+			period_end?: string;
+		},
+	): Promise<PnLResult> => {
+		const { start, end } = resolveRange(req, { required: true });
 
-		// Fetch all posted ledger lines for the period
+		// Sum all posted Revenue/Expense activity across the period range.
 		const rows = db.query<{
 			account_code: string;
 			account_name: string;
@@ -929,7 +963,7 @@ export const getProfitAndLoss = api(
       JOIN ledger_lines ll ON coa.account_code = ll.account_code
       JOIN journal_entries je ON ll.journal_entry_id = je.id
         AND je.is_posted = TRUE
-        AND je.fiscal_period = ${req.fiscal_period}
+        AND je.fiscal_period BETWEEN ${start} AND ${end}
       WHERE coa.account_class IN ('Revenue', 'Expense')
       GROUP BY coa.account_code, coa.account_name, coa.account_class
       ORDER BY coa.account_code
@@ -977,7 +1011,9 @@ export const getProfitAndLoss = api(
 		const netProfit = netOperatingIncome;
 
 		return {
-			period: req.fiscal_period,
+			period: periodLabel(start, end),
+			period_start: start,
+			period_end: end,
 			revenue_lines: revenueLines,
 			cogs_lines: cogsLines,
 			opex_lines: opexLines,
@@ -993,7 +1029,18 @@ export const getProfitAndLoss = api(
 
 export const getBalanceSheet = api(
 	{ expose: true, auth: true, method: "GET", path: "/financial/balance-sheet" },
-	async (req: { fiscal_period?: string }): Promise<BalanceSheetResult> => {
+	async (
+		req: {
+			fiscal_period?: string;
+			period_start?: string;
+			period_end?: string;
+		},
+	): Promise<BalanceSheetResult> => {
+		// Position statement: cumulative balances AS OF the end of the range.
+		// The MAX_PERIOD sentinel makes an omitted period an all-time snapshot.
+		const { end: asOfEnd } = resolveRange(req);
+		const allTime = asOfEnd === MAX_PERIOD;
+
 		const rows = db.query<{
 			account_code: string;
 			account_name: string;
@@ -1009,7 +1056,9 @@ export const getBalanceSheet = api(
         COALESCE(SUM(ll.credit), 0) AS total_credit
       FROM chart_of_accounts coa
       LEFT JOIN ledger_lines ll ON coa.account_code = ll.account_code
-      LEFT JOIN journal_entries je ON ll.journal_entry_id = je.id AND je.is_posted = TRUE
+      LEFT JOIN journal_entries je ON ll.journal_entry_id = je.id
+        AND je.is_posted = TRUE
+        AND je.fiscal_period <= ${asOfEnd}
       WHERE coa.account_class IN ('Asset', 'Liability', 'Equity') AND coa.is_active = TRUE
       GROUP BY coa.account_code, coa.account_name, coa.account_class
       ORDER BY coa.account_code
@@ -1056,8 +1105,11 @@ export const getBalanceSheet = api(
        ) AS net_income
        FROM chart_of_accounts coa
        JOIN ledger_lines ll  ON coa.account_code = ll.account_code
-       JOIN journal_entries je ON ll.journal_entry_id = je.id AND je.is_posted = TRUE
+       JOIN journal_entries je ON ll.journal_entry_id = je.id
+         AND je.is_posted = TRUE
+         AND je.fiscal_period <= $1
        WHERE coa.account_class IN ('Revenue', 'Expense')`,
+			asOfEnd,
 		);
 		const netIncome = Math.round(Number(niRow?.net_income ?? 0) * 100) / 100;
 		if (Math.abs(netIncome) > 0.005) {
@@ -1072,7 +1124,7 @@ export const getBalanceSheet = api(
 		const totalLE = Math.round((totalLiabilities + totalEquity) * 100) / 100;
 
 		return {
-			as_of_period: req.fiscal_period ?? "all-time",
+			as_of_period: allTime ? "all-time" : asOfEnd,
 			assets,
 			liabilities,
 			equity,
@@ -1089,12 +1141,17 @@ export const getBalanceSheet = api(
 
 export const getDisbursements = api(
 	{ expose: true, auth: true, method: "GET", path: "/financial/disbursements" },
-	async (req: { fiscal_period: string }): Promise<DisbursementResult> => {
-		if (!/^\d{4}-\d{2}$/.test(req.fiscal_period)) {
-			throw APIError.invalidArgument("fiscal_period must be in YYYY-MM format");
-		}
+	async (
+		req: {
+			fiscal_period?: string;
+			period_start?: string;
+			period_end?: string;
+		},
+	): Promise<DisbursementResult> => {
+		const { start, end } = resolveRange(req, { required: true });
+		const label = periodLabel(start, end);
 
-		// Check trial balance is balanced
+		// Check the trial balance is balanced across the range
 		const balanceCheck = await db.rawQueryRow<{
 			debit_sum: number;
 			credit_sum: number;
@@ -1102,8 +1159,9 @@ export const getDisbursements = api(
 			`SELECT COALESCE(SUM(ll.debit), 0) AS debit_sum, COALESCE(SUM(ll.credit), 0) AS credit_sum
        FROM ledger_lines ll
        JOIN journal_entries je ON ll.journal_entry_id = je.id
-         AND je.is_posted = TRUE AND je.fiscal_period = $1`,
-			req.fiscal_period,
+         AND je.is_posted = TRUE AND je.fiscal_period BETWEEN $1 AND $2`,
+			start,
+			end,
 		);
 
 		const debitSum = Number(balanceCheck?.debit_sum ?? 0);
@@ -1111,7 +1169,9 @@ export const getDisbursements = api(
 
 		if (Math.abs(debitSum - creditSum) > 0.005) {
 			return {
-				period: req.fiscal_period,
+				period: label,
+				period_start: start,
+				period_end: end,
 				gross_revenue: 0,
 				net_profit: 0,
 				retained_earnings_20pct: 0,
@@ -1124,12 +1184,17 @@ export const getDisbursements = api(
 			};
 		}
 
-		// Compute P&L — no tax/VAT, so net profit is Net Operating Income
-		const pnl = await getProfitAndLoss({ fiscal_period: req.fiscal_period });
+		// Compute P&L over the range — no tax/VAT, net profit = Net Operating Income
+		const pnl = await getProfitAndLoss({
+			period_start: start,
+			period_end: end,
+		});
 
 		if (pnl.net_profit <= 0) {
 			return {
-				period: req.fiscal_period,
+				period: label,
+				period_start: start,
+				period_end: end,
 				gross_revenue: pnl.gross_revenue,
 				net_profit: pnl.net_profit,
 				retained_earnings_20pct: 0,
@@ -1150,7 +1215,7 @@ export const getDisbursements = api(
       SELECT id, partner_id, fiscal_period, amount, drawn_by_name, reference, notes,
              draw_date::text AS draw_date, created_by, created_by_name, created_at
       FROM partner_draws
-      WHERE fiscal_period = ${req.fiscal_period}
+      WHERE fiscal_period BETWEEN ${start} AND ${end}
       ORDER BY draw_date ASC, created_at ASC
     `;
 		const allDraws: PartnerDraw[] = [];
@@ -1206,7 +1271,9 @@ export const getDisbursements = api(
 		);
 
 		return {
-			period: req.fiscal_period,
+			period: label,
+			period_start: start,
+			period_end: end,
 			gross_revenue: pnl.gross_revenue,
 			net_profit: pnl.net_profit,
 			retained_earnings_20pct: retainedEarnings,
