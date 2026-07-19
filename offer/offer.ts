@@ -340,7 +340,7 @@ export const createOffer = api(
 				${id}, ${reference}, ${input.candidate_name}, ${input.candidate_email}, ${input.candidate_phone ?? null},
 				${input.job_title}, ${input.department ?? null}, ${input.work_location ?? null},
 				${input.customer_id ?? null}, ${input.customer_name ?? null},
-				${input.employment_type ?? "full_time"}, ${input.joining_date ?? null}, ${input.offer_expiry_date ?? null},
+				${input.employment_type ?? "full_time"}, ${input.joining_date || null}, ${input.offer_expiry_date || null},
 				${input.probation_months ?? null}, ${input.notice_period_days ?? null}, ${input.annual_leave_days ?? null},
 				${input.currency ?? "SAR"}, ${input.monthly_salary ?? 0}, ${input.basic_amount ?? null}, ${input.housing_allowance ?? null},
 				${input.transport_allowance ?? null}, ${input.other_allowance ?? null}, ${input.benefits ?? null}, ${input.additional_terms ?? null},
@@ -425,6 +425,7 @@ export const updateOffer = api(
 		}
 
 		const s = (v: string | undefined) => v ?? null;
+		const d = (v: string | undefined) => v || null; // empty string is not a valid DATE
 		const n = (v: number | undefined) => v ?? null;
 		await db.exec`
 			UPDATE offer_letters SET
@@ -437,8 +438,8 @@ export const updateOffer = api(
 				customer_id       = CASE WHEN ${input.customer_id !== undefined} THEN ${s(input.customer_id)} ELSE customer_id END,
 				customer_name     = CASE WHEN ${input.customer_name !== undefined} THEN ${s(input.customer_name)} ELSE customer_name END,
 				employment_type   = COALESCE(${s(input.employment_type)}, employment_type),
-				joining_date      = CASE WHEN ${input.joining_date !== undefined} THEN ${s(input.joining_date)} ELSE joining_date END,
-				offer_expiry_date = CASE WHEN ${input.offer_expiry_date !== undefined} THEN ${s(input.offer_expiry_date)} ELSE offer_expiry_date END,
+				joining_date      = CASE WHEN ${input.joining_date !== undefined} THEN ${d(input.joining_date)} ELSE joining_date END,
+				offer_expiry_date = CASE WHEN ${input.offer_expiry_date !== undefined} THEN ${d(input.offer_expiry_date)} ELSE offer_expiry_date END,
 				probation_months  = CASE WHEN ${input.probation_months !== undefined} THEN ${n(input.probation_months)} ELSE probation_months END,
 				notice_period_days= CASE WHEN ${input.notice_period_days !== undefined} THEN ${n(input.notice_period_days)} ELSE notice_period_days END,
 				annual_leave_days = CASE WHEN ${input.annual_leave_days !== undefined} THEN ${n(input.annual_leave_days)} ELSE annual_leave_days END,
