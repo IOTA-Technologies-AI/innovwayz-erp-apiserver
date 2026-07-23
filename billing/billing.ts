@@ -2,6 +2,8 @@ import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { Topic, Subscription } from "encore.dev/pubsub";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
+import { CronJob } from "encore.dev/cron";
+import { user } from "~encore/clients";
 import { UserCreatedTopic } from "../user/user";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
@@ -1028,3 +1030,326 @@ async function fetchFamilyMember(id: string): Promise<FamilyMember> {
 	if (!row) throw APIError.notFound("family member not found");
 	return row;
 }
+
+// ─── Document renewal alerts + approval workflow ──────────────────────────────
+// Daily cron emails the responsible BDM/Account Manager (from bdm_assignments,
+// falling back to admins) as each tracked document nears expiry: 90/60/30 days
+// then a breach notice + daily reminders, deduped via the alert_*_sent_at
+// columns (same pattern as the contract expiry cron).
+
+const DOC_TYPE_LABEL: Record<string, string> = {
+	Iqama: "Iqama",
+	Insurance: "Medical Insurance",
+	GOSI: "GOSI",
+	Saudi_Council_Engineers: "Saudi Council of Engineers",
+	Air_Ticket: "Annual Air Ticket",
+	Passport: "Passport",
+	Other: "Document",
+};
+
+function docLabel(t: string): string {
+	return DOC_TYPE_LABEL[t] ?? t;
+}
+
+function docEmailShell(heading: string, rows: string): string {
+	return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0" style="padding:40px 16px;"><tr><td align="center">
+    <table width="600" cellpadding="0" cellspacing="0" style="max-width:600px;width:100%;">
+      <tr><td style="background:#0f172a;border-radius:12px 12px 0 0;padding:24px 40px;text-align:center;">
+        <span style="color:#fff;font-size:20px;font-weight:700;">InnovWayz ERP</span>
+      </td></tr>
+      <tr><td style="background:#fff;border-radius:0 0 12px 12px;padding:32px 40px;">
+        <h2 style="margin:0 0 20px;color:#0f172a;font-size:18px;">${heading}</h2>
+        <table width="100%" cellpadding="0" cellspacing="0">${rows}</table>
+      </td></tr>
+    </table>
+  </td></tr></table>
+</body></html>`;
+}
+
+function drow(label: string, value: string): string {
+	return `<tr>
+    <td style="padding:6px 0;color:#64748b;font-size:13px;width:40%;">${label}</td>
+    <td style="padding:6px 0;color:#0f172a;font-size:13px;font-weight:600;">${value}</td>
+  </tr>`;
+}
+
+/** Responsible recipients for an employee: assigned BDMs, then admins. */
+async function resolveDocRecipients(employeeId: string): Promise<string[]> {
+	const ids = new Set<string>();
+	const rows = db.rawQuery<{ bdm_user_id: string }>(
+		`SELECT bdm_user_id FROM bdm_assignments WHERE employee_id = $1::uuid`,
+		employeeId,
+	);
+	for await (const r of rows) ids.add(r.bdm_user_id);
+	try {
+		const { users } = await user.listByRoles({
+			roles: ["admin", "super_admin"],
+		});
+		for (const u of users) ids.add(u.id);
+	} catch (err) {
+		log.warn("doc alerts: admin lookup failed", { error: String(err) });
+	}
+	return [...ids];
+}
+
+interface AlertRow {
+	id: string;
+	employee_id: string;
+	employee_name: string;
+	document_type: string;
+	document_number: string | null;
+	expiry_date: string;
+	days_remaining: number;
+	alert_90_sent_at: string | null;
+	alert_60_sent_at: string | null;
+	alert_30_sent_at: string | null;
+	breach_notified_at: string | null;
+	last_daily_alert_at: string | null;
+}
+
+/** Which alert tier (if any) to fire for a document this run. */
+function pickAlertTier(
+	d: AlertRow,
+	today: string,
+): { column: string; tone: string } | null {
+	const days = d.days_remaining;
+	if (days <= 0) {
+		if (!d.breach_notified_at) return { column: "breach_notified_at", tone: "breach" };
+		// Already breached — one daily reminder at most.
+		if (!d.last_daily_alert_at || d.last_daily_alert_at.slice(0, 10) < today)
+			return { column: "last_daily_alert_at", tone: "daily" };
+		return null;
+	}
+	if (days <= 30 && !d.alert_30_sent_at) return { column: "alert_30_sent_at", tone: "30" };
+	if (days <= 60 && !d.alert_60_sent_at) return { column: "alert_60_sent_at", tone: "60" };
+	if (days <= 90 && !d.alert_90_sent_at) return { column: "alert_90_sent_at", tone: "90" };
+	return null;
+}
+
+/** Optional `status` SET clause to reflect the document's expiry state. */
+function docStatusClause(days: number): string {
+	if (days <= 0) return ", status = 'expired'";
+	if (days <= 30)
+		return ", status = CASE WHEN status = 'active' THEN 'expiring' ELSE status END";
+	return "";
+}
+
+/** Build the alert email (subject + html) for a document about to expire. */
+function buildDocAlert(d: AlertRow): { subject: string; html: string } {
+	const days = d.days_remaining;
+	const label = docLabel(d.document_type);
+	const expired = days <= 0;
+	const heading = expired
+		? `EXPIRED: ${label} — ${d.employee_name}`
+		: `${label} expiring in ${days} days — ${d.employee_name}`;
+	const html = docEmailShell(
+		heading,
+		drow("Employee", d.employee_name) +
+			drow("Document", label) +
+			(d.document_number ? drow("Number", d.document_number) : "") +
+			drow("Expiry", d.expiry_date) +
+			drow(
+				"Status",
+				expired ? `Expired ${-days} day(s) ago` : `${days} day(s) remaining`,
+			),
+	);
+	const subject = expired
+		? `[Renewal] EXPIRED — ${label} — ${d.employee_name}`
+		: `[Renewal] ${label} expiring in ${days}d — ${d.employee_name}`;
+	return { subject, html };
+}
+
+async function runDocumentRenewalAlerts(): Promise<{
+	checked: number;
+	notified: number;
+}> {
+	const today = new Date().toISOString().slice(0, 10);
+	const rows = db.rawQuery<AlertRow>(
+		`SELECT d.id, d.employee_id, e.name AS employee_name,
+		        d.document_type, d.document_number,
+		        d.expiry_date::TEXT AS expiry_date,
+		        (d.expiry_date - CURRENT_DATE)::int AS days_remaining,
+		        d.alert_90_sent_at::TEXT AS alert_90_sent_at,
+		        d.alert_60_sent_at::TEXT AS alert_60_sent_at,
+		        d.alert_30_sent_at::TEXT AS alert_30_sent_at,
+		        d.breach_notified_at::TEXT AS breach_notified_at,
+		        d.last_daily_alert_at::TEXT AS last_daily_alert_at
+		 FROM employee_documents d
+		 JOIN employees e ON e.id = d.employee_id
+		 WHERE d.expiry_date IS NOT NULL
+		   AND d.status <> 'renewed'
+		   AND d.expiry_date <= CURRENT_DATE + INTERVAL '90 days'`,
+	);
+
+	let checked = 0;
+	let notified = 0;
+	for await (const d of rows) {
+		checked++;
+		const tier = pickAlertTier(d, today);
+		if (!tier) continue;
+
+		const { subject, html } = buildDocAlert(d);
+		const recipients = await resolveDocRecipients(d.employee_id);
+		await Promise.all(
+			recipients.map((uid) =>
+				user.sendNotification({ to: uid, subject, html }).catch(() => {}),
+			),
+		);
+		// Stamp the dedup column and reflect the expiry status.
+		await db.rawExec(
+			`UPDATE employee_documents SET ${tier.column} = NOW()${docStatusClause(d.days_remaining)}, updated_at = NOW() WHERE id = $1::uuid`,
+			d.id,
+		);
+		if (recipients.length > 0) notified++;
+	}
+	return { checked, notified };
+}
+
+// Internal endpoint invoked by the daily cron.
+export const checkDocumentRenewalsCron = api(
+	{ expose: false, method: "POST", path: "/internal/employee-documents/alerts/cron" },
+	async (): Promise<{ checked: number; notified: number }> => {
+		const res = await runDocumentRenewalAlerts();
+		log.info("document renewal alerts run", res);
+		return res;
+	},
+);
+
+const _docAlertCron = new CronJob("employee-document-renewals", {
+	title: "Employee document renewal alerts (90/60/30 days + breach)",
+	schedule: "0 8 * * *",
+	endpoint: checkDocumentRenewalsCron,
+});
+
+// Manual trigger for testing (admin only).
+export const triggerDocumentRenewals = api(
+	{ expose: true, auth: true, method: "POST", path: "/employee-documents/alerts/run" },
+	async (): Promise<{ checked: number; notified: number }> => {
+		const { role } = getAuthData()!;
+		if (!["admin", "super_admin"].includes(role))
+			throw APIError.permissionDenied("admin only");
+		return runDocumentRenewalAlerts();
+	},
+);
+
+// ─── Renewal approval workflow ────────────────────────────────────────────────
+// Ensures a document renewal is approved before its expiry: a renewal is
+// requested (→ pending_renewal, notifies approvers), then approved (records the
+// new expiry, resets alerts, → active) or rejected.
+
+export const requestDocumentRenewal = api(
+	{ expose: true, auth: true, method: "POST", path: "/employee-documents/:id/request-renewal" },
+	async ({ id }: { id: string }): Promise<EmployeeDocument> => {
+		const { role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		const doc = await fetchDocument(id);
+		await db.exec`
+			UPDATE employee_documents
+			SET status = 'pending_renewal', rejected_by = NULL, rejected_at = NULL,
+			    rejection_reason = NULL, updated_at = NOW()
+			WHERE id = ${id}::uuid
+		`;
+		const emp = await db.queryRow<{ name: string }>`
+			SELECT name FROM employees WHERE id = ${doc.employee_id}::uuid
+		`;
+		const html = docEmailShell(
+			"Document renewal requested — approval needed",
+			drow("Employee", emp?.name ?? "—") +
+				drow("Document", docLabel(doc.document_type)) +
+				drow("Current expiry", doc.expiry_date ?? "—"),
+		);
+		try {
+			const { users } = await user.listByRoles({
+				roles: ["admin", "super_admin"],
+			});
+			await Promise.all(
+				users.map((u) =>
+					user
+						.sendNotification({
+							to: u.id,
+							subject: `[Renewal] Approval needed — ${docLabel(doc.document_type)} — ${emp?.name ?? ""}`,
+							html,
+						})
+						.catch(() => {}),
+				),
+			);
+		} catch {
+			/* non-fatal */
+		}
+		return fetchDocument(id);
+	},
+);
+
+interface ApproveRenewalInput {
+	id: string;
+	/** New expiry date once renewed (YYYY-MM-DD). */
+	new_expiry_date?: string;
+	document_number?: string;
+}
+
+export const approveDocumentRenewal = api(
+	{ expose: true, auth: true, method: "POST", path: "/employee-documents/:id/approve-renewal" },
+	async (req: ApproveRenewalInput): Promise<EmployeeDocument> => {
+		const { userID, role } = getAuthData()!;
+		if (!["admin", "super_admin", "manager"].includes(role))
+			throw APIError.permissionDenied("approver role required");
+		// Approving records the new expiry, clears the reminder stamps so alerts
+		// re-arm for the new date, and returns the document to active.
+		await db.exec`
+			UPDATE employee_documents SET
+				expiry_date     = COALESCE(${req.new_expiry_date ?? null}, expiry_date),
+				document_number = COALESCE(${req.document_number ?? null}, document_number),
+				status          = 'active',
+				approved_by     = ${userID}, approved_at = NOW(),
+				rejected_by     = NULL, rejected_at = NULL, rejection_reason = NULL,
+				alert_90_sent_at = NULL, alert_60_sent_at = NULL, alert_30_sent_at = NULL,
+				breach_notified_at = NULL, last_daily_alert_at = NULL,
+				updated_at      = NOW()
+			WHERE id = ${req.id}::uuid
+		`;
+		const doc = await fetchDocument(req.id);
+		// Notify the responsible BDM/AM that it is cleared.
+		const recipients = await resolveDocRecipients(doc.employee_id);
+		const html = docEmailShell(
+			"Document renewal approved",
+			drow("Document", docLabel(doc.document_type)) +
+				drow("New expiry", doc.expiry_date ?? "—"),
+		);
+		await Promise.all(
+			recipients.map((uid) =>
+				user
+					.sendNotification({
+						to: uid,
+						subject: `[Renewal] Approved — ${docLabel(doc.document_type)}`,
+						html,
+					})
+					.catch(() => {}),
+			),
+		);
+		return doc;
+	},
+);
+
+interface RejectRenewalInput {
+	id: string;
+	reason?: string;
+}
+
+export const rejectDocumentRenewal = api(
+	{ expose: true, auth: true, method: "POST", path: "/employee-documents/:id/reject-renewal" },
+	async (req: RejectRenewalInput): Promise<EmployeeDocument> => {
+		const { userID, role } = getAuthData()!;
+		if (!["admin", "super_admin", "manager"].includes(role))
+			throw APIError.permissionDenied("approver role required");
+		await db.exec`
+			UPDATE employee_documents SET
+				status = 'active', rejected_by = ${userID}, rejected_at = NOW(),
+				rejection_reason = ${req.reason ?? null}, updated_at = NOW()
+			WHERE id = ${req.id}::uuid
+		`;
+		return fetchDocument(req.id);
+	},
+);
