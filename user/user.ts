@@ -571,20 +571,32 @@ async function decryptPassword(value: string): Promise<string> {
 
 // ─── Resend email helper ──────────────────────────────────────────────────────
 
+/** Optional email attachment: base64-encoded `content` + display `filename`. */
+export interface EmailAttachment {
+	filename: string;
+	content: string;
+}
+
 async function sendEmail(
 	to: string,
 	subject: string,
 	html: string,
+	attachments?: EmailAttachment[],
 ): Promise<void> {
 	const fromEmail =
 		resendFromEmail() || "InnovWayz ERP <noreply@emails.innovwayz.io>";
+	const payload: Record<string, unknown> = { from: fromEmail, to, subject, html };
+	if (attachments && attachments.length > 0) {
+		// Resend accepts an `attachments` array of { filename, content(base64) }.
+		payload.attachments = attachments;
+	}
 	const res = await fetch("https://api.resend.com/emails", {
 		method: "POST",
 		headers: {
 			Authorization: `Bearer ${resendApiKey()}`,
 			"Content-Type": "application/json",
 		},
-		body: JSON.stringify({ from: fromEmail, to, subject, html }),
+		body: JSON.stringify(payload),
 	});
 	if (!res.ok) {
 		const body = await res.text();
@@ -1211,13 +1223,16 @@ export const sendNotification = api(
 		to,
 		subject,
 		html,
+		attachments,
 	}: {
 		to: string;
 		subject: string;
 		html: string;
+		/** Optional file attachments (e.g. a payslip PDF as base64). */
+		attachments?: EmailAttachment[];
 	}): Promise<{ ok: boolean }> => {
 		try {
-			await sendEmail(to, subject, html);
+			await sendEmail(to, subject, html, attachments);
 			return { ok: true };
 		} catch (err) {
 			log.error("failed to send notification email", {

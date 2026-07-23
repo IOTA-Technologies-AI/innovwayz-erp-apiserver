@@ -1,5 +1,7 @@
 import { APIError, Gateway, Header } from "encore.dev/api";
 import { authHandler } from "encore.dev/auth";
+import log from "encore.dev/log";
+import { permissions } from "~encore/clients";
 import { validateToken } from "../user/user";
 
 // AuthParams reads a Bearer token from the Authorization header.
@@ -11,6 +13,13 @@ interface AuthParams {
 interface AuthData {
 	userID: string;
 	role: string;
+	/**
+	 * Effective module-access routes granted to this user (["*"] = all).
+	 * Loaded from the permissions service so services can authorize by module
+	 * grant, not just role. Empty on a permissions-service outage (degrades to
+	 * role-based checks).
+	 */
+	allowedRoutes: string[];
 }
 
 /**
@@ -32,7 +41,22 @@ export const auth = authHandler<AuthParams, AuthData>(
 		}
 
 		const { user_id, role } = await validateToken({ token });
-		return { userID: user_id, role };
+
+		// Load the user's module grants so downstream services can authorize by
+		// module, not just role. Best-effort: a permissions outage must not break
+		// authentication — fall back to empty (role-based checks still apply).
+		let allowedRoutes: string[] = [];
+		try {
+			const res = await permissions.getEffectiveRoutes({ user_id, role });
+			allowedRoutes = res.allowed_routes;
+		} catch (err) {
+			log.error("failed to load permissions for auth context", {
+				user_id,
+				error: String(err),
+			});
+		}
+
+		return { userID: user_id, role, allowedRoutes };
 	},
 );
 

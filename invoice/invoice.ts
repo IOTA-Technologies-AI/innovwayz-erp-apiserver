@@ -4,6 +4,7 @@ import { SQLDatabase } from "encore.dev/storage/sqldb";
 import { user, billing, financial } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
+import { canAccessModule, MODULE_ROUTES } from "../authz/capabilities";
 
 const db = new SQLDatabase("invoice", {
 	migrations: "./migrations",
@@ -60,6 +61,16 @@ function isFinance(role: string): boolean {
 }
 function canManage(role: string): boolean {
 	return isManager(role) || isFinance(role);
+}
+
+/**
+ * Invoice view/create/edit capability: a privileged role, OR a user who was
+ * granted the Invoices module route via Access Control. Used for everything
+ * except delete (super_admin) and ledger reconciliation (finance/manager).
+ */
+function canManageInvoices(): boolean {
+	const auth = getAuthData()!;
+	return canManage(auth.role) || canAccessModule(auth, MODULE_ROUTES.invoices);
 }
 
 const INVOICE_COLUMNS = `
@@ -214,8 +225,8 @@ interface CreateInvoiceRequest {
 export const createInvoice = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices" },
 	async (req: CreateInvoiceRequest): Promise<Invoice> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageInvoices())
 			throw APIError.permissionDenied(
 				"only managers or finance can raise invoices",
 			);
@@ -269,8 +280,8 @@ interface GenerateInvoicesResponse {
 export const generateMonthlyInvoices = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/generate" },
 	async (req: GenerateInvoicesRequest): Promise<GenerateInvoicesResponse> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageInvoices())
 			throw APIError.permissionDenied(
 				"only managers or finance can generate invoices",
 			);
@@ -365,7 +376,7 @@ interface ListInvoicesResponse {
 export const listInvoices = api(
 	{ expose: true, auth: true, method: "GET", path: "/invoices" },
 	async (p: ListInvoicesParams): Promise<ListInvoicesResponse> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 
 		const clauses: string[] = [];
 		const args: (string | number | boolean | null)[] = [];
@@ -375,7 +386,7 @@ export const listInvoices = api(
 		};
 
 		// Plain users only see invoices they raised.
-		const restrictToOwn = !canManage(role) || !!p.mine;
+		const restrictToOwn = !canManageInvoices() || !!p.mine;
 		if (restrictToOwn) add("created_by = $?", userID);
 
 		if (p.status) add("status = $?", p.status);
@@ -463,9 +474,9 @@ export const invoiceFilterOptions = api(
 export const getInvoice = api(
 	{ expose: true, auth: true, method: "GET", path: "/invoices/:id" },
 	async ({ id }: { id: string }): Promise<Invoice> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 		const inv = await fetchInvoice(id);
-		if (!canManage(role) && inv.created_by !== userID)
+		if (!canManageInvoices() && inv.created_by !== userID)
 			throw APIError.permissionDenied("not allowed to view this invoice");
 		return inv;
 	},
@@ -492,8 +503,8 @@ interface UpdateInvoiceRequest {
 export const updateInvoice = api(
 	{ expose: true, auth: true, method: "PUT", path: "/invoices/:id" },
 	async (req: UpdateInvoiceRequest): Promise<Invoice> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageInvoices())
 			throw APIError.permissionDenied(
 				"only managers or finance can edit invoices",
 			);
@@ -563,8 +574,8 @@ interface SendInvoiceRequest {
 export const sendInvoice = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/:id/send" },
 	async (req: SendInvoiceRequest): Promise<Invoice> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageInvoices())
 			throw APIError.permissionDenied(
 				"only managers or finance can send invoices",
 			);
@@ -619,8 +630,8 @@ interface PayInvoiceRequest {
 export const payInvoice = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/:id/pay" },
 	async (req: PayInvoiceRequest): Promise<Invoice> => {
-		const { userID, role } = getAuthData()!;
-		if (!isFinance(role) && !isManager(role))
+		const { userID } = getAuthData()!;
+		if (!canManageInvoices())
 			throw APIError.permissionDenied("only finance can record payments");
 		const inv = await fetchInvoice(req.id);
 		if (["paid", "cancelled"].includes(inv.status))
@@ -697,8 +708,8 @@ interface CancelInvoiceRequest {
 export const cancelInvoice = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/:id/cancel" },
 	async (req: CancelInvoiceRequest): Promise<Invoice> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageInvoices())
 			throw APIError.permissionDenied(
 				"only managers or finance can cancel invoices",
 			);

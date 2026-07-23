@@ -2,9 +2,10 @@ import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
 import { CronJob } from "encore.dev/cron";
-import { user, billing, financial } from "~encore/clients";
+import { user, billing, financial, request } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
+import { canAccessModule, MODULE_ROUTES } from "../authz/capabilities";
 
 const db = new SQLDatabase("payroll", {
 	migrations: "./migrations",
@@ -70,6 +71,8 @@ export interface SalaryPayment {
 	paid_at: string | null;
 	posted_by: string | null;
 	posted_at: string | null;
+	/** When the payslip PDF was emailed to the employee (null = not yet sent). */
+	payslip_sent_at: string | null;
 	created_at: string;
 	updated_at: string;
 }
@@ -84,6 +87,21 @@ function isAdmin(role: string): boolean {
 }
 function isFinance(role: string): boolean {
 	return ["finance", "super_admin"].includes(role);
+}
+
+/**
+ * Salary view/create/edit capability: a manager/finance role, OR a user granted
+ * the Salaries module route. The approval chain (approve/reject), finance
+ * processing (process/pay/batch/reconcile) and delete keep their own role checks
+ * for separation of duties.
+ */
+function canManageSalaries(): boolean {
+	const auth = getAuthData()!;
+	return (
+		isManager(auth.role) ||
+		isFinance(auth.role) ||
+		canAccessModule(auth, MODULE_ROUTES.salaries)
+	);
 }
 
 // ─── Ledger posting (Corp Finance) ────────────────────────────────────────────
@@ -111,7 +129,7 @@ const SALARY_COLUMNS = `
   manager_approved_by, manager_approved_at, admin_approved_by, admin_approved_at,
   rejected_by, rejected_at, rejection_reason,
   processed_by, processed_at, payment_reference, paid_amount, paid_at,
-  posted_by, posted_at,
+  posted_by, posted_at, payslip_sent_at,
   created_at, updated_at
 `;
 
@@ -241,6 +259,47 @@ function salaryRows(s: SalaryPayment): string {
 		row("Net payable", SAR(Number(s.net_amount))),
 		row("Raised by", s.created_by_name ?? "—"),
 	].join("");
+}
+
+/**
+ * Email the employee their payslip PDF once a salary is marked paid. Best-effort
+ * and idempotent: skips if already sent (`payslip_sent_at`) or the employee has
+ * no email on file, and any failure is logged — it never blocks the payment.
+ */
+async function sendPayslipEmail(s: SalaryPayment): Promise<void> {
+	if (s.payslip_sent_at || !s.employee_id) return;
+	try {
+		const slip = await request.generateEmployeePayslip({
+			employee_id: s.employee_id,
+			period_month: s.period_month,
+			period_year: s.period_year,
+		});
+		if (!slip.employee_email) {
+			log.warn("payslip email skipped: employee has no email on file", {
+				salary_id: s.id,
+				employee_id: s.employee_id,
+			});
+			return;
+		}
+		const { ok } = await user.sendNotification({
+			to: slip.employee_email,
+			subject: `Your payslip — ${monthLabel(s.period_month, s.period_year)}`,
+			html: emailShell(
+				"Your Payslip",
+				salaryRows(s),
+				"Your salary has been paid. Your payslip for this period is attached to this email.",
+			),
+			attachments: [{ filename: slip.file_name, content: slip.data_base64 }],
+		});
+		if (ok) {
+			await db.exec`UPDATE salary_payments SET payslip_sent_at = NOW() WHERE id = ${s.id}`;
+		}
+	} catch (err) {
+		log.error("failed to email payslip", {
+			salary_id: s.id,
+			error: String(err),
+		});
+	}
 }
 
 // ─── Reference generation ─────────────────────────────────────────────────────
@@ -470,8 +529,8 @@ interface CreateSalaryRequest {
 export const createSalaryPayment = api(
 	{ expose: true, auth: true, method: "POST", path: "/payroll" },
 	async (req: CreateSalaryRequest): Promise<SalaryPayment> => {
-		const { userID, role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		const { userID } = getAuthData()!;
+		if (!canManageSalaries())
 			throw APIError.permissionDenied(
 				"only managers, admins or finance can raise salary payments",
 			);
@@ -640,8 +699,8 @@ async function generateForPeriod(
 export const generateMonthlyPayroll = api(
 	{ expose: true, auth: true, method: "POST", path: "/payroll/generate" },
 	async (req: GenerateMonthlyRequest): Promise<GenerateMonthlyResponse> => {
-		const { userID, role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		const { userID } = getAuthData()!;
+		if (!canManageSalaries())
 			throw APIError.permissionDenied(
 				"only managers, admins or finance can generate payroll",
 			);
@@ -703,7 +762,7 @@ interface ListSalaryParams {
 export const listSalaryPayments = api(
 	{ expose: true, auth: true, method: "GET", path: "/payroll" },
 	async (p: ListSalaryParams): Promise<{ salaries: SalaryPayment[] }> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 
 		const clauses: string[] = [];
 		const args: (string | number | boolean | null)[] = [];
@@ -712,10 +771,9 @@ export const listSalaryPayments = api(
 			clauses.push(clause.replace("$?", `$${args.length}`));
 		};
 
-		// Only managers/finance see everyone; others see nothing unless it's theirs.
-		if (!isManager(role) && !isFinance(role)) {
-			add("created_by = $?", userID);
-		} else if (p.mine) {
+		// Managers/finance and users granted the Salaries module see everyone;
+		// others see nothing unless it's theirs.
+		if (!canManageSalaries() || p.mine) {
 			add("created_by = $?", userID);
 		}
 		if (p.status) add("status = $?", p.status);
@@ -738,9 +796,9 @@ export const listSalaryPayments = api(
 export const getSalaryPayment = api(
 	{ expose: true, auth: true, method: "GET", path: "/payroll/:id" },
 	async ({ id }: { id: string }): Promise<SalaryPayment> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 		const s = await fetchSalary(id);
-		if (!isManager(role) && !isFinance(role) && s.created_by !== userID)
+		if (!canManageSalaries() && s.created_by !== userID)
 			throw APIError.permissionDenied(
 				"not allowed to view this salary payment",
 			);
@@ -783,7 +841,7 @@ export const updateSalaryPayment = api(
 			current.created_by === userID &&
 			["draft", "pending_manager"].includes(current.status);
 		const managerEditable =
-			isManager(role) &&
+			(isManager(role) || canManageSalaries()) &&
 			["draft", "pending_manager", "pending_admin"].includes(current.status);
 		if (!creatorEditable && !managerEditable)
 			throw APIError.permissionDenied(
@@ -886,11 +944,11 @@ export const deleteSalaryPayment = api(
 export const postSalaryPayment = api(
 	{ expose: true, auth: true, method: "POST", path: "/payroll/:id/post" },
 	async ({ id }: { id: string }): Promise<SalaryPayment> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 		const s = await fetchSalary(id);
 		if (s.status !== "draft")
 			throw APIError.failedPrecondition("only draft salaries can be posted");
-		if (s.created_by !== userID && !isManager(role) && !isFinance(role))
+		if (s.created_by !== userID && !canManageSalaries())
 			throw APIError.permissionDenied(
 				"not allowed to post this salary payment",
 			);
@@ -1149,6 +1207,8 @@ export const processSalaryPayment = api(
 					"This salary payment has been processed and paid.",
 				),
 			);
+			// Email the employee their payslip PDF (best-effort, never blocks).
+			void sendPayslipEmail(updated);
 			return updated;
 		}
 
@@ -1208,6 +1268,8 @@ export const payBatch = api(
 				period_month: s.period_month,
 				period_year: s.period_year,
 			});
+			// Email the employee their payslip PDF (best-effort, never blocks).
+			void sendPayslipEmail(s);
 			paidCount++;
 		}
 

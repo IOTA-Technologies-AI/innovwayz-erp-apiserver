@@ -15,6 +15,7 @@ import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
+import { canAccessModule, MODULE_ROUTES } from "../authz/capabilities";
 
 const db = new SQLDatabase("financial", {
 	migrations: "./migrations",
@@ -27,6 +28,16 @@ function isFinance(role: string): boolean {
 }
 function canManage(role: string): boolean {
 	return ["admin", "super_admin", "finance"].includes(role);
+}
+
+/**
+ * Corp-Finance view/create-draft capability: a finance/admin role, OR a user
+ * granted any Corp-Finance route. Posting the ledger, editing/deleting journal
+ * entries and purging keep their own finance/admin checks.
+ */
+function canManageFinancial(): boolean {
+	const auth = getAuthData()!;
+	return canManage(auth.role) || canAccessModule(auth, MODULE_ROUTES.financial);
 }
 
 // ─── Period handling ──────────────────────────────────────────────────────────
@@ -326,8 +337,8 @@ export const createAccount = api(
 		account_class: string;
 		parent_code?: string;
 	}): Promise<ChartOfAccount> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		const { account_code, account_name, account_class, parent_code } = req;
@@ -376,8 +387,8 @@ export const updateAccount = api(
 		account_name?: string;
 		is_active?: boolean;
 	}): Promise<ChartOfAccount> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		const existing = await db.queryRow<ChartOfAccount>`
@@ -424,8 +435,8 @@ export const createBankClient = api(
 		contact_name?: string;
 		contact_email?: string;
 	}): Promise<BankClient> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		const id = crypto.randomUUID();
@@ -468,8 +479,8 @@ export const createResource = api(
 		resource_type: string;
 		monthly_cogs_cost: number;
 	}): Promise<FinancialResource> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 		if (req.monthly_cogs_cost < 0)
 			throw APIError.invalidArgument("monthly_cogs_cost must be >= 0");
@@ -524,8 +535,8 @@ export const createPlacement = api(
 		start_date: string;
 		end_date?: string;
 	}): Promise<ResourcePlacement> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		const id = crypto.randomUUID();
@@ -648,8 +659,8 @@ export const createJournalEntry = api(
 		description: string;
 		lines: CreateLedgerLineInput[];
 	}): Promise<JournalEntry> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		if (!/^\d{4}-\d{2}$/.test(req.fiscal_period)) {
@@ -1321,8 +1332,8 @@ export const recordDraw = api(
 		notes?: string;
 		draw_date?: string;
 	}): Promise<PartnerDraw> => {
-		const { userID, role } = getAuthData()!;
-		if (!canManage(role))
+		const { userID } = getAuthData()!;
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		if (!/^\d{4}-\d{2}$/.test(req.fiscal_period))
@@ -1419,8 +1430,7 @@ export const getAuditLog = api(
 		limit?: number;
 		offset?: number;
 	}): Promise<{ entries: AuditLogEntry[]; total: number }> => {
-		const { role } = getAuthData()!;
-		if (!canManage(role))
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 
 		const limit = Math.min(req.limit ?? 50, 200);
@@ -1621,8 +1631,7 @@ export const recordAutoEntry = api(
 export const previewAutoEntryPurge = api(
 	{ expose: true, auth: true, method: "GET", path: "/financial/auto-entries/preview" },
 	async (): Promise<{ count: number; total_debit: number; total_credit: number }> => {
-		const { role } = getAuthData()!;
-		if (!canManage(role))
+		if (!canManageFinancial())
 			throw APIError.permissionDenied("Finance or Admin role required");
 		const row = await db.rawQueryRow<{ n: string; d: string; c: string }>(
 			`SELECT COUNT(DISTINCT je.id)::TEXT AS n,

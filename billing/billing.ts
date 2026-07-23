@@ -592,6 +592,8 @@ export interface EmployeeCompensation {
 	band: string | null;
 	location: string | null;
 	payment_mode: string | null;
+	// Contact — used to email the payslip to the employee
+	email: string | null;
 }
 
 /**
@@ -615,7 +617,7 @@ export const getEmployeeCompensation = api(
         s.housing_allowance::float8   AS housing_allowance,
         s.transport_allowance::float8 AS transport_allowance,
         s.other_allowance::float8     AS other_allowance,
-        e.national_id, e.band, e.location, e.payment_mode
+        e.national_id, e.band, e.location, e.payment_mode, e.email
       FROM employees e
       JOIN customers c ON e.customer_id = c.id
       LEFT JOIN LATERAL (

@@ -92,6 +92,24 @@ function defaultsForRole(role: string): string[] {
 	return DEFAULT_ROUTES[role] ?? DEFAULT_ROUTES["user"];
 }
 
+/**
+ * Effective allowed routes for a user: super_admin → all; otherwise the stored
+ * grant, falling back to the role defaults when no explicit record exists.
+ * Shared by the frontend `/permissions/me` and the internal endpoint the auth
+ * handler uses to load grants into the auth context.
+ */
+async function computeAllowedRoutes(
+	userId: string,
+	role: string,
+): Promise<string[]> {
+	if (role === "super_admin") return ["*"];
+	const row = await db.rawQueryRow<{ allowed_routes: string[] }>(
+		`SELECT allowed_routes FROM user_permissions WHERE user_id = $1`,
+		userId,
+	);
+	return row ? row.allowed_routes : defaultsForRole(role);
+}
+
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface UserPermissionRecord {
@@ -122,6 +140,24 @@ export const getMyPermissions = api(
 			return { allowed_routes: defaultsForRole(role), is_default: true };
 		}
 		return { allowed_routes: row.allowed_routes, is_default: false };
+	},
+);
+
+// ─── Internal: effective routes for the auth context ──────────────────────────
+// Called by the auth handler on each request to load a user's module grants into
+// AuthData. Internal + unauthenticated (the auth handler runs before auth data
+// exists); the caller passes the already-validated user_id and role.
+
+export const getEffectiveRoutes = api(
+	{ expose: false, auth: false, method: "POST", path: "/internal/permissions/effective-routes" },
+	async ({
+		user_id,
+		role,
+	}: {
+		user_id: string;
+		role: string;
+	}): Promise<{ allowed_routes: string[] }> => {
+		return { allowed_routes: await computeAllowedRoutes(user_id, role) };
 	},
 );
 

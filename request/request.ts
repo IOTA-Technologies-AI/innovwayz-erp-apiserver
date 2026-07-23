@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 import {
 	generateExperienceLetter,
 	generateSalaryCertificate,
+	type LetterData,
 	type SalaryCertificateData,
 } from "./letters";
 
@@ -213,6 +214,158 @@ function slugify(name: string): string {
  * (employment dates) services, render the PDF and store it against the
  * request. Regeneration inserts a new version; the latest one is served.
  */
+type EmployeeCompensation = Awaited<
+	ReturnType<typeof billing.getEmployeeCompensation>
+>;
+
+/** Employment dates + formal job title from the contract service (best-effort). */
+async function resolveEmploymentDetails(employeeId: string): Promise<{
+	dateOfJoining: string | null;
+	dateOfRelieving: string | null;
+	jobTitle: string | null;
+}> {
+	let dateOfJoining: string | null = null;
+	let dateOfRelieving: string | null = null;
+	let jobTitle: string | null = null;
+	try {
+		const { contracts } = await contract.listContracts({
+			employee_id: employeeId,
+			limit: 100,
+		});
+		const employment = contracts
+			.filter((c) => c.status !== "draft")
+			.sort((a, b) => b.start_date.localeCompare(a.start_date));
+		if (employment.length > 0) {
+			const latest = employment[0];
+			// Joining date = earliest contract start across the employment chain
+			dateOfJoining = employment[employment.length - 1].start_date;
+			jobTitle = latest.job_title;
+			if (["terminated", "expired"].includes(latest.status)) {
+				dateOfRelieving =
+					latest.end_date ?? latest.terminated_at?.slice(0, 10) ?? null;
+			}
+		}
+	} catch (err) {
+		log.warn("employment details lookup failed", {
+			employee_id: employeeId,
+			error: String(err),
+		});
+	}
+	return { dateOfJoining, dateOfRelieving, jobTitle };
+}
+
+/**
+ * Assemble the full payslip (salary-certificate) data for an employee. Keyed by
+ * employee + optional pay period: with a period, uses that exact salary_payment
+ * row; otherwise the latest non-rejected one. Shared by the HR-request letter
+ * flow and the internal payslip endpoint used on salary payment.
+ */
+async function buildSalaryCertificateData(
+	employeeId: string,
+	emp: EmployeeCompensation,
+	base: LetterData,
+	opts: { periodMonth?: number; periodYear?: number } = {},
+): Promise<SalaryCertificateData> {
+	if (!emp.monthly_salary || emp.monthly_salary <= 0) {
+		throw new Error(
+			"no salary on record for this employee — set the monthly salary before generating a payslip",
+		);
+	}
+
+	// Per-period figures from the payroll record: overtime/additions, the
+	// itemized deductions, attendance/leaves and the pay period.
+	let overtime = 0;
+	let salaryAdvance = 0;
+	let latest: Awaited<
+		ReturnType<typeof payroll.listSalaryPayments>
+	>["salaries"][number] | undefined;
+	try {
+		const { salaries } = await payroll.listSalaryPayments(
+			opts.periodMonth && opts.periodYear
+				? {
+						employee_id: employeeId,
+						period_month: opts.periodMonth,
+						period_year: opts.periodYear,
+					}
+				: { employee_id: employeeId },
+		);
+		latest = salaries.find(
+			(s) => !["rejected", "cancelled"].includes(s.status),
+		);
+		if (latest) {
+			overtime = Number(latest.additions) || 0;
+			// Prefer the itemized advance; fall back to the legacy lump for records
+			// created before the payslip breakdown existed.
+			salaryAdvance =
+				Number(latest.salary_advance) || Number(latest.deductions) || 0;
+		}
+	} catch (err) {
+		log.warn("payslip: payroll lookup failed", {
+			employee_id: employeeId,
+			error: String(err),
+		});
+	}
+
+	// Loss-of-pay days: from the payroll record when one exists; otherwise
+	// derived from leave balances (days used beyond entitlement + carry-forward).
+	let leaveLopDays = 0;
+	try {
+		const { balances } = await leave.listLeaveBalances({
+			employee_id: employeeId,
+			year: new Date().getFullYear(),
+		});
+		for (const bal of balances) {
+			const allowed =
+				(Number(bal.entitled_days) || 0) +
+				(Number(bal.carry_forward_days) || 0);
+			const used = Number(bal.used_days) || 0;
+			if (used > allowed) leaveLopDays += used - allowed;
+		}
+	} catch (err) {
+		log.warn("payslip: leave balance lookup failed", {
+			employee_id: employeeId,
+			error: String(err),
+		});
+	}
+	const lossOfPayDays = latest
+		? Number(latest.loss_of_pay_days) || 0
+		: Math.round(leaveLopDays * 100) / 100;
+
+	const now = new Date();
+	return {
+		...base,
+		currency: latest?.currency || "SAR",
+		monthlySalary: emp.monthly_salary,
+		breakdown: {
+			basic: emp.basic_amount,
+			housing: emp.housing_allowance,
+			transport: emp.transport_allowance,
+			other: emp.other_allowance,
+		},
+		overtime,
+		lossOfPayDays,
+		salaryAdvance,
+		// Employee-level payslip identity
+		mode: emp.payment_mode,
+		nationalId: emp.national_id,
+		band: emp.band,
+		location: emp.location,
+		// Per-period payslip figures
+		periodMonth: latest?.period_month ?? opts.periodMonth ?? now.getMonth() + 1,
+		periodYear: latest?.period_year ?? opts.periodYear ?? now.getFullYear(),
+		payDate: latest?.pay_date ?? null,
+		attendanceDays: latest?.attendance_days ?? null,
+		governmentHolidays: latest ? Number(latest.government_holidays) || 0 : 0,
+		annualLeaves: latest ? Number(latest.annual_leaves) || 0 : 0,
+		sickLeaves: latest ? Number(latest.sick_leaves) || 0 : 0,
+		daysPayable: latest ? Number(latest.days_payable) || 30 : 30,
+		remoteWorkHalf: latest?.remote_work_half ?? false,
+		employeeRequestsDeduction: latest
+			? Number(latest.employee_requests_deduction) || 0
+			: 0,
+	};
+}
+
 async function generateLetterForRequest(
 	req: EmployeeRequest,
 	actorId: string,
@@ -254,34 +407,8 @@ async function generateLetterForRequest(
 
 	const emp = await billing.getEmployeeCompensation({ id: employeeId });
 
-	// Employment dates + formal job title from the contract service (optional).
-	let dateOfJoining: string | null = null;
-	let dateOfRelieving: string | null = null;
-	let jobTitle: string | null = null;
-	try {
-		const { contracts } = await contract.listContracts({
-			employee_id: employeeId,
-			limit: 100,
-		});
-		const employment = contracts
-			.filter((c) => c.status !== "draft")
-			.sort((a, b) => b.start_date.localeCompare(a.start_date));
-		if (employment.length > 0) {
-			const latest = employment[0];
-			// Joining date = earliest contract start across the employment chain
-			dateOfJoining = employment[employment.length - 1].start_date;
-			jobTitle = latest.job_title;
-			if (["terminated", "expired"].includes(latest.status)) {
-				dateOfRelieving =
-					latest.end_date ?? latest.terminated_at?.slice(0, 10) ?? null;
-			}
-		}
-	} catch (err) {
-		log.warn("letter generation: contract lookup failed", {
-			request_id: req.id,
-			error: String(err),
-		});
-	}
+	const { dateOfJoining, dateOfRelieving, jobTitle } =
+		await resolveEmploymentDetails(employeeId);
 
 	const employeeCode =
 		emp.serial_no != null
@@ -302,100 +429,7 @@ async function generateLetterForRequest(
 	let pdf: Buffer;
 	let label: string;
 	if (req.request_type === "salary_certificate") {
-		if (!emp.monthly_salary || emp.monthly_salary <= 0) {
-			throw new Error(
-				"no salary on record for this employee — set the monthly salary before generating a salary certificate",
-			);
-		}
-
-		// Per-period payslip figures come from the latest non-rejected payroll
-		// record (list is sorted latest period first): overtime/additions, the
-		// itemized deductions, attendance/leaves and the pay period.
-		let overtime = 0;
-		let salaryAdvance = 0;
-		let latest: Awaited<
-			ReturnType<typeof payroll.listSalaryPayments>
-		>["salaries"][number] | undefined;
-		try {
-			const { salaries } = await payroll.listSalaryPayments({
-				employee_id: employeeId,
-			});
-			latest = salaries.find(
-				(s) => !["rejected", "cancelled"].includes(s.status),
-			);
-			if (latest) {
-				overtime = Number(latest.additions) || 0;
-				// Prefer the itemized advance; fall back to the legacy lump for
-				// records created before the payslip breakdown existed.
-				salaryAdvance =
-					Number(latest.salary_advance) || Number(latest.deductions) || 0;
-			}
-		} catch (err) {
-			log.warn("letter generation: payroll lookup failed", {
-				request_id: req.id,
-				error: String(err),
-			});
-		}
-
-		// Loss-of-pay days: taken from the payroll record when one exists;
-		// otherwise derived from leave balances (days used beyond entitlement +
-		// carry-forward across all leave types).
-		let leaveLopDays = 0;
-		try {
-			const { balances } = await leave.listLeaveBalances({
-				employee_id: employeeId,
-				year: new Date().getFullYear(),
-			});
-			for (const bal of balances) {
-				const allowed =
-					(Number(bal.entitled_days) || 0) +
-					(Number(bal.carry_forward_days) || 0);
-				const used = Number(bal.used_days) || 0;
-				if (used > allowed) leaveLopDays += used - allowed;
-			}
-		} catch (err) {
-			log.warn("letter generation: leave balance lookup failed", {
-				request_id: req.id,
-				error: String(err),
-			});
-		}
-		const lossOfPayDays = latest
-			? Number(latest.loss_of_pay_days) || 0
-			: Math.round(leaveLopDays * 100) / 100;
-
-		const now = new Date();
-		const data: SalaryCertificateData = {
-			...base,
-			currency: latest?.currency || "SAR",
-			monthlySalary: emp.monthly_salary,
-			breakdown: {
-				basic: emp.basic_amount,
-				housing: emp.housing_allowance,
-				transport: emp.transport_allowance,
-				other: emp.other_allowance,
-			},
-			overtime,
-			lossOfPayDays,
-			salaryAdvance,
-			// Employee-level payslip identity
-			mode: emp.payment_mode,
-			nationalId: emp.national_id,
-			band: emp.band,
-			location: emp.location,
-			// Per-period payslip figures
-			periodMonth: latest?.period_month ?? now.getMonth() + 1,
-			periodYear: latest?.period_year ?? now.getFullYear(),
-			payDate: latest?.pay_date ?? null,
-			attendanceDays: latest?.attendance_days ?? null,
-			governmentHolidays: latest ? Number(latest.government_holidays) || 0 : 0,
-			annualLeaves: latest ? Number(latest.annual_leaves) || 0 : 0,
-			sickLeaves: latest ? Number(latest.sick_leaves) || 0 : 0,
-			daysPayable: latest ? Number(latest.days_payable) || 30 : 30,
-			remoteWorkHalf: latest?.remote_work_half ?? false,
-			employeeRequestsDeduction: latest
-				? Number(latest.employee_requests_deduction) || 0
-				: 0,
-		};
+		const data = await buildSalaryCertificateData(employeeId, emp, base);
 		pdf = await generateSalaryCertificate(data);
 		label = "Salary_Certificate";
 	} else {
@@ -416,6 +450,66 @@ async function generateLetterForRequest(
 	await logEvent(req.id, "letter_generated", actorId, fileName);
 	return fileName;
 }
+
+// ─── Internal: generate a payslip PDF for an employee + period ────────────────
+// Used by the payroll service to attach a payslip to the "salary paid" email.
+// Not tied to an HR request row; returns the PDF (base64) + the employee's email.
+
+interface GeneratePayslipRequest {
+	employee_id: string;
+	period_month?: number;
+	period_year?: number;
+}
+
+interface GeneratePayslipResponse {
+	file_name: string;
+	data_base64: string;
+	employee_name: string;
+	employee_email: string | null;
+}
+
+export const generateEmployeePayslip = api(
+	{ expose: false, auth: false, method: "POST", path: "/internal/payslip" },
+	async (req: GeneratePayslipRequest): Promise<GeneratePayslipResponse> => {
+		const emp = await billing.getEmployeeCompensation({ id: req.employee_id });
+		const { dateOfJoining, dateOfRelieving, jobTitle } =
+			await resolveEmploymentDetails(req.employee_id);
+
+		const employeeCode =
+			emp.serial_no != null
+				? `INW-${String(emp.serial_no).padStart(4, "0")}`
+				: null;
+		const period =
+			req.period_month && req.period_year
+				? `${req.period_year}-${String(req.period_month).padStart(2, "0")}`
+				: new Date().toISOString().slice(0, 7);
+
+		const base: LetterData = {
+			reference: `PAYSLIP-${period}`,
+			employeeName: emp.name,
+			employeeCode,
+			designation: jobTitle ?? emp.position,
+			clientName: emp.customer_name,
+			dateOfJoining,
+			dateOfRelieving,
+			purpose: null,
+		};
+
+		const data = await buildSalaryCertificateData(req.employee_id, emp, base, {
+			periodMonth: req.period_month,
+			periodYear: req.period_year,
+		});
+		const pdf = await generateSalaryCertificate(data);
+		const fileName = `Payslip-${slugify(emp.name)}-${period}.pdf`;
+
+		return {
+			file_name: fileName,
+			data_base64: pdf.toString("base64"),
+			employee_name: emp.name,
+			employee_email: emp.email,
+		};
+	},
+);
 
 // ─── Create ───────────────────────────────────────────────────────────────────
 

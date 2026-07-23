@@ -4,6 +4,7 @@ import { SQLDatabase } from "encore.dev/storage/sqldb";
 import { user, financial } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
+import { canAccessModule, MODULE_ROUTES } from "../authz/capabilities";
 
 const db = new SQLDatabase("expense", {
 	migrations: "./migrations",
@@ -82,6 +83,20 @@ function isAdmin(role: string): boolean {
 }
 function isFinance(role: string): boolean {
 	return ["finance", "super_admin"].includes(role);
+}
+
+/**
+ * Expense view/create/edit capability: a manager/finance role, OR a user
+ * granted the Expenses module route. Sensitive actions (approve, process/pay,
+ * delete, ledger reconcile) keep their own role checks.
+ */
+function canManageExpenses(): boolean {
+	const auth = getAuthData()!;
+	return (
+		isManager(auth.role) ||
+		isFinance(auth.role) ||
+		canAccessModule(auth, MODULE_ROUTES.expenses)
+	);
 }
 
 // Cash-basis ledger posting: only PAID expenses post, at payment time, as
@@ -405,7 +420,7 @@ interface ListExpensesResponse {
 export const listExpenses = api(
 	{ expose: true, auth: true, method: "GET", path: "/expenses" },
 	async (p: ListExpensesParams): Promise<ListExpensesResponse> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 
 		const clauses: string[] = [];
 		const args: (string | number | boolean | null)[] = [];
@@ -415,7 +430,7 @@ export const listExpenses = api(
 		};
 
 		// Plain users only see their own expenses; managers/finance can opt into 'mine'.
-		const restrictToOwn = (!isManager(role) && !isFinance(role)) || !!p.mine;
+		const restrictToOwn = !canManageExpenses() || !!p.mine;
 		if (restrictToOwn) {
 			add("created_by = $?", userID);
 		}
@@ -505,9 +520,9 @@ export const expenseFilterOptions = api(
 export const getExpense = api(
 	{ expose: true, auth: true, method: "GET", path: "/expenses/:id" },
 	async ({ id }: { id: string }): Promise<Expense> => {
-		const { userID, role } = getAuthData()!;
+		const { userID } = getAuthData()!;
 		const e = await fetchExpense(id);
-		if (!isManager(role) && !isFinance(role) && e.created_by !== userID)
+		if (!canManageExpenses() && e.created_by !== userID)
 			throw APIError.permissionDenied("not allowed to view this expense");
 		return e;
 	},
@@ -547,7 +562,8 @@ export const updateExpense = api(
 			current.created_by === userID &&
 			["draft", "pending_manager"].includes(current.status);
 		const adminEditable =
-			isAdmin(role) && !["paid", "cancelled"].includes(current.status);
+			(isAdmin(role) || canManageExpenses()) &&
+			!["paid", "cancelled"].includes(current.status);
 		if (!creatorEditable && !adminEditable)
 			throw APIError.permissionDenied("not allowed to edit this expense");
 
@@ -1024,8 +1040,7 @@ async function fetchRecurring(id: string): Promise<RecurringExpense> {
 export const listRecurringExpenses = api(
 	{ expose: true, auth: true, method: "GET", path: "/recurring-expenses" },
 	async (): Promise<{ items: RecurringExpense[] }> => {
-		const { role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		if (!canManageExpenses())
 			throw APIError.permissionDenied(
 				"not allowed to view recurring templates",
 			);
@@ -1061,8 +1076,8 @@ interface CreateRecurringRequest {
 export const createRecurringExpense = api(
 	{ expose: true, auth: true, method: "POST", path: "/recurring-expenses" },
 	async (req: CreateRecurringRequest): Promise<RecurringExpense> => {
-		const { userID, role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		const { userID } = getAuthData()!;
+		if (!canManageExpenses())
 			throw APIError.permissionDenied(
 				"not allowed to manage recurring templates",
 			);
@@ -1106,8 +1121,7 @@ interface UpdateRecurringRequest extends Partial<CreateRecurringRequest> {
 export const updateRecurringExpense = api(
 	{ expose: true, auth: true, method: "PUT", path: "/recurring-expenses/:id" },
 	async ({ id, ...req }: UpdateRecurringRequest): Promise<RecurringExpense> => {
-		const { role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		if (!canManageExpenses())
 			throw APIError.permissionDenied(
 				"not allowed to manage recurring templates",
 			);
@@ -1146,8 +1160,7 @@ export const deleteRecurringExpense = api(
 		path: "/recurring-expenses/:id",
 	},
 	async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
-		const { role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		if (!canManageExpenses())
 			throw APIError.permissionDenied(
 				"not allowed to manage recurring templates",
 			);
@@ -1237,8 +1250,8 @@ async function insertGeneratedExpense(
 export const generateMonthlyExpenses = api(
 	{ expose: true, auth: true, method: "POST", path: "/expenses/generate" },
 	async (req: GenerateExpensesRequest): Promise<GenerateExpensesResponse> => {
-		const { userID, role } = getAuthData()!;
-		if (!isManager(role) && !isFinance(role))
+		const { userID } = getAuthData()!;
+		if (!canManageExpenses())
 			throw APIError.permissionDenied("not allowed to generate expenses");
 		if (req.period_month < 1 || req.period_month > 12)
 			throw APIError.invalidArgument("period_month must be between 1 and 12");
