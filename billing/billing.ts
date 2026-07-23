@@ -4,6 +4,7 @@ import { Topic, Subscription } from "encore.dev/pubsub";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
 import { UserCreatedTopic } from "../user/user";
 import log from "encore.dev/log";
+import crypto from "node:crypto";
 
 const db = new SQLDatabase("billing", {
 	migrations: "./migrations",
@@ -755,3 +756,275 @@ export const removeEmployeeFromBdm = api(
 		return { ok: true };
 	},
 );
+
+// ─── Employee allied documents ────────────────────────────────────────────────
+// Iqama, Insurance, GOSI, Saudi Council of Engineers cert, air ticket, passport,
+// … each with an expiry_date that drives renewal reminders (Phase 3 cron).
+
+function isHrManager(role: string): boolean {
+	return ["manager", "admin", "super_admin"].includes(role);
+}
+
+export interface EmployeeDocument {
+	id: string;
+	employee_id: string;
+	document_type: string;
+	document_number: string | null;
+	issue_date: string | null;
+	expiry_date: string | null;
+	status: string;
+	notes: string | null;
+	has_file: boolean;
+	approved_by: string | null;
+	approved_at: string | null;
+	rejected_by: string | null;
+	rejected_at: string | null;
+	rejection_reason: string | null;
+	created_by: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+// file_base64 is excluded from list/detail payloads (heavy) — fetched separately.
+const DOC_COLS = `
+  id, employee_id, document_type, document_number,
+  issue_date::TEXT  AS issue_date,
+  expiry_date::TEXT AS expiry_date,
+  status, notes,
+  (file_base64 IS NOT NULL) AS has_file,
+  approved_by, approved_at, rejected_by, rejected_at, rejection_reason,
+  created_by, created_at, updated_at
+`;
+
+export const listEmployeeDocuments = api(
+	{ expose: true, auth: true, method: "GET", path: "/employees/:employeeId/documents" },
+	async ({ employeeId }: { employeeId: string }): Promise<{ documents: EmployeeDocument[] }> => {
+		getAuthData()!;
+		const rows = db.rawQuery<EmployeeDocument>(
+			`SELECT ${DOC_COLS} FROM employee_documents
+			 WHERE employee_id = $1::uuid
+			 ORDER BY expiry_date NULLS LAST, document_type`,
+			employeeId,
+		);
+		const documents: EmployeeDocument[] = [];
+		for await (const r of rows) documents.push(r);
+		return { documents };
+	},
+);
+
+interface UpsertDocumentInput {
+	employeeId: string;
+	document_type: string;
+	document_number?: string | null;
+	issue_date?: string | null;
+	expiry_date?: string | null;
+	status?: string;
+	notes?: string | null;
+	file_base64?: string | null;
+}
+
+export const createEmployeeDocument = api(
+	{ expose: true, auth: true, method: "POST", path: "/employees/:employeeId/documents" },
+	async (req: UpsertDocumentInput): Promise<EmployeeDocument> => {
+		const { userID, role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		if (!req.document_type)
+			throw APIError.invalidArgument("document_type is required");
+		const id = crypto.randomUUID();
+		await db.exec`
+			INSERT INTO employee_documents (
+				id, employee_id, document_type, document_number,
+				issue_date, expiry_date, status, notes, file_base64, created_by
+			) VALUES (
+				${id}, ${req.employeeId}::uuid, ${req.document_type}, ${req.document_number ?? null},
+				${req.issue_date ?? null}, ${req.expiry_date ?? null},
+				${req.status ?? "active"}, ${req.notes ?? null}, ${req.file_base64 ?? null}, ${userID}
+			)
+		`;
+		return fetchDocument(id);
+	},
+);
+
+interface UpdateDocumentInput {
+	id: string;
+	document_type?: string;
+	document_number?: string | null;
+	issue_date?: string | null;
+	expiry_date?: string | null;
+	status?: string;
+	notes?: string | null;
+	file_base64?: string | null;
+}
+
+export const updateEmployeeDocument = api(
+	{ expose: true, auth: true, method: "PUT", path: "/employee-documents/:id" },
+	async (req: UpdateDocumentInput): Promise<EmployeeDocument> => {
+		const { role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		// Changing the expiry resets the reminder-dedup stamps so alerts re-fire
+		// for the new date.
+		const resetAlerts = req.expiry_date !== undefined;
+		await db.exec`
+			UPDATE employee_documents SET
+				document_type   = COALESCE(${req.document_type ?? null}, document_type),
+				document_number = CASE WHEN ${req.document_number !== undefined} THEN ${req.document_number ?? null} ELSE document_number END,
+				issue_date      = CASE WHEN ${req.issue_date !== undefined} THEN ${req.issue_date ?? null} ELSE issue_date END,
+				expiry_date     = CASE WHEN ${req.expiry_date !== undefined} THEN ${req.expiry_date ?? null} ELSE expiry_date END,
+				status          = COALESCE(${req.status ?? null}, status),
+				notes           = CASE WHEN ${req.notes !== undefined} THEN ${req.notes ?? null} ELSE notes END,
+				file_base64     = CASE WHEN ${req.file_base64 !== undefined} THEN ${req.file_base64 ?? null} ELSE file_base64 END,
+				alert_90_sent_at    = CASE WHEN ${resetAlerts} THEN NULL ELSE alert_90_sent_at END,
+				alert_60_sent_at    = CASE WHEN ${resetAlerts} THEN NULL ELSE alert_60_sent_at END,
+				alert_30_sent_at    = CASE WHEN ${resetAlerts} THEN NULL ELSE alert_30_sent_at END,
+				breach_notified_at  = CASE WHEN ${resetAlerts} THEN NULL ELSE breach_notified_at END,
+				last_daily_alert_at = CASE WHEN ${resetAlerts} THEN NULL ELSE last_daily_alert_at END,
+				updated_at      = NOW()
+			WHERE id = ${req.id}::uuid
+		`;
+		return fetchDocument(req.id);
+	},
+);
+
+export const deleteEmployeeDocument = api(
+	{ expose: true, auth: true, method: "DELETE", path: "/employee-documents/:id" },
+	async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		await db.exec`DELETE FROM employee_documents WHERE id = ${id}::uuid`;
+		return { ok: true };
+	},
+);
+
+export const getEmployeeDocumentFile = api(
+	{ expose: true, auth: true, method: "GET", path: "/employee-documents/:id/file" },
+	async ({ id }: { id: string }): Promise<{ file_base64: string | null }> => {
+		getAuthData()!;
+		const row = await db.rawQueryRow<{ file_base64: string | null }>(
+			`SELECT file_base64 FROM employee_documents WHERE id = $1::uuid`,
+			id,
+		);
+		if (!row) throw APIError.notFound("document not found");
+		return { file_base64: row.file_base64 };
+	},
+);
+
+async function fetchDocument(id: string): Promise<EmployeeDocument> {
+	const row = await db.rawQueryRow<EmployeeDocument>(
+		`SELECT ${DOC_COLS} FROM employee_documents WHERE id = $1::uuid`,
+		id,
+	);
+	if (!row) throw APIError.notFound("document not found");
+	return row;
+}
+
+// ─── Family members ───────────────────────────────────────────────────────────
+
+export interface FamilyMember {
+	id: string;
+	employee_id: string;
+	name: string;
+	relationship: string | null;
+	is_dependent: boolean;
+	id_number: string | null;
+	date_of_birth: string | null;
+	notes: string | null;
+	created_at: string;
+	updated_at: string;
+}
+
+const FAMILY_COLS = `
+  id, employee_id, name, relationship, is_dependent, id_number,
+  date_of_birth::TEXT AS date_of_birth, notes, created_at, updated_at
+`;
+
+export const listFamilyMembers = api(
+	{ expose: true, auth: true, method: "GET", path: "/employees/:employeeId/family" },
+	async ({ employeeId }: { employeeId: string }): Promise<{ members: FamilyMember[] }> => {
+		getAuthData()!;
+		const rows = db.rawQuery<FamilyMember>(
+			`SELECT ${FAMILY_COLS} FROM family_members WHERE employee_id = $1::uuid ORDER BY created_at`,
+			employeeId,
+		);
+		const members: FamilyMember[] = [];
+		for await (const r of rows) members.push(r);
+		return { members };
+	},
+);
+
+interface UpsertFamilyInput {
+	employeeId: string;
+	name: string;
+	relationship?: string | null;
+	is_dependent?: boolean;
+	id_number?: string | null;
+	date_of_birth?: string | null;
+	notes?: string | null;
+}
+
+export const createFamilyMember = api(
+	{ expose: true, auth: true, method: "POST", path: "/employees/:employeeId/family" },
+	async (req: UpsertFamilyInput): Promise<FamilyMember> => {
+		const { role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		if (!req.name) throw APIError.invalidArgument("name is required");
+		const id = crypto.randomUUID();
+		await db.exec`
+			INSERT INTO family_members (
+				id, employee_id, name, relationship, is_dependent, id_number, date_of_birth, notes
+			) VALUES (
+				${id}, ${req.employeeId}::uuid, ${req.name}, ${req.relationship ?? null},
+				${req.is_dependent ?? true}, ${req.id_number ?? null}, ${req.date_of_birth ?? null}, ${req.notes ?? null}
+			)
+		`;
+		return fetchFamilyMember(id);
+	},
+);
+
+interface UpdateFamilyInput {
+	id: string;
+	name?: string;
+	relationship?: string | null;
+	is_dependent?: boolean;
+	id_number?: string | null;
+	date_of_birth?: string | null;
+	notes?: string | null;
+}
+
+export const updateFamilyMember = api(
+	{ expose: true, auth: true, method: "PUT", path: "/family-members/:id" },
+	async (req: UpdateFamilyInput): Promise<FamilyMember> => {
+		const { role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		await db.exec`
+			UPDATE family_members SET
+				name          = COALESCE(${req.name ?? null}, name),
+				relationship  = CASE WHEN ${req.relationship !== undefined} THEN ${req.relationship ?? null} ELSE relationship END,
+				is_dependent  = COALESCE(${req.is_dependent ?? null}, is_dependent),
+				id_number     = CASE WHEN ${req.id_number !== undefined} THEN ${req.id_number ?? null} ELSE id_number END,
+				date_of_birth = CASE WHEN ${req.date_of_birth !== undefined} THEN ${req.date_of_birth ?? null} ELSE date_of_birth END,
+				notes         = CASE WHEN ${req.notes !== undefined} THEN ${req.notes ?? null} ELSE notes END,
+				updated_at    = NOW()
+			WHERE id = ${req.id}::uuid
+		`;
+		return fetchFamilyMember(req.id);
+	},
+);
+
+export const deleteFamilyMember = api(
+	{ expose: true, auth: true, method: "DELETE", path: "/family-members/:id" },
+	async ({ id }: { id: string }): Promise<{ ok: boolean }> => {
+		const { role } = getAuthData()!;
+		if (!isHrManager(role)) throw APIError.permissionDenied("managers only");
+		await db.exec`DELETE FROM family_members WHERE id = ${id}::uuid`;
+		return { ok: true };
+	},
+);
+
+async function fetchFamilyMember(id: string): Promise<FamilyMember> {
+	const row = await db.rawQueryRow<FamilyMember>(
+		`SELECT ${FAMILY_COLS} FROM family_members WHERE id = $1::uuid`,
+		id,
+	);
+	if (!row) throw APIError.notFound("family member not found");
+	return row;
+}
