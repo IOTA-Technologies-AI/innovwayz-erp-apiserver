@@ -1,7 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
-import { user, billing, financial } from "~encore/clients";
+import { user, contract, financial } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
 import { canAccessModule, MODULE_ROUTES } from "../authz/capabilities";
@@ -30,7 +30,10 @@ export interface Invoice {
 	period_month: number | null;
 	period_year: number | null;
 	description: string | null;
+	contract_id: string | null;
 	amount: number;
+	vat_rate: number;
+	vat_amount: number;
 	total_amount: number;
 	currency: string;
 	revenue_account: string;
@@ -75,8 +78,8 @@ function canManageInvoices(): boolean {
 
 const INVOICE_COLUMNS = `
   id, reference, customer_id, customer_name, employee_id, employee_name,
-  period_month, period_year, description,
-  amount, total_amount, currency, revenue_account, status,
+  period_month, period_year, description, contract_id,
+  amount, vat_rate, vat_amount, total_amount, currency, revenue_account, status,
   issue_date, due_date, paid_date, paid_amount, payment_reference, notes,
   created_by, created_by_name, sent_by, sent_at, cancelled_by, cancelled_at,
   created_at, updated_at
@@ -161,7 +164,11 @@ function invoiceRows(inv: Invoice): string {
 		row("Reference", inv.reference),
 		row("Customer", inv.customer_name),
 		inv.employee_name ? row("Employee", inv.employee_name) : "",
-		row("Amount", SAR(Number(inv.total_amount))),
+		row("Net", SAR(Number(inv.amount))),
+		Number(inv.vat_amount)
+			? row(`VAT (${Number(inv.vat_rate)}%)`, SAR(Number(inv.vat_amount)))
+			: "",
+		row("Total", SAR(Number(inv.total_amount))),
 		inv.issue_date ? row("Issued", inv.issue_date) : "",
 		inv.due_date ? row("Due", inv.due_date) : "",
 		row("Raised by", inv.created_by_name ?? "—"),
@@ -214,7 +221,10 @@ interface CreateInvoiceRequest {
 	period_month?: number;
 	period_year?: number;
 	description?: string;
+	contract_id?: string;
 	amount: number;
+	/** VAT rate % applied on the net amount (e.g. 15). Defaults to 0. */
+	vat_rate?: number;
 	currency?: string;
 	revenue_account?: string;
 	issue_date?: string;
@@ -236,7 +246,10 @@ export const createInvoice = api(
 			throw APIError.invalidArgument("amount must be zero or positive");
 
 		const amount = round2(Number(req.amount));
-		const total = amount; // No tax/VAT — total always equals the net amount.
+		// VAT is an invoice-document figure; total = net + VAT.
+		const vatRate = round2(Number(req.vat_rate ?? 0));
+		const vatAmount = round2((amount * vatRate) / 100);
+		const total = round2(amount + vatAmount);
 		const revenueAccount = resolveRevenueAccount(req.revenue_account);
 		const id = crypto.randomUUID();
 		const reference = await nextReference();
@@ -247,14 +260,15 @@ export const createInvoice = api(
 		await db.exec`
       INSERT INTO invoices (
         id, reference, customer_id, customer_name, employee_id, employee_name,
-        period_month, period_year, description,
-        amount, total_amount, currency, revenue_account, status,
+        period_month, period_year, description, contract_id,
+        amount, vat_rate, vat_amount, total_amount, currency, revenue_account, status,
         issue_date, due_date, notes, created_by, created_by_name
       ) VALUES (
         ${id}, ${reference}, ${req.customer_id ?? null}, ${req.customer_name},
         ${req.employee_id ?? null}, ${req.employee_name ?? null},
         ${req.period_month ?? null}, ${req.period_year ?? null}, ${req.description ?? null},
-        ${amount}, ${total}, ${req.currency ?? "SAR"}, ${revenueAccount}, 'draft',
+        ${req.contract_id ?? null},
+        ${amount}, ${vatRate}, ${vatAmount}, ${total}, ${req.currency ?? "SAR"}, ${revenueAccount}, 'draft',
         ${req.issue_date ?? null}, ${req.due_date ?? null}, ${req.notes ?? null},
         ${userID}, ${contact.name ?? null}
       )
@@ -265,7 +279,7 @@ export const createInvoice = api(
 	},
 );
 
-// ─── Generate monthly invoices from employee billing ──────────────────────────
+// ─── Generate monthly invoices from active contracts ──────────────────────────
 
 interface GenerateInvoicesRequest {
 	period_month: number;
@@ -277,6 +291,11 @@ interface GenerateInvoicesResponse {
 	total_amount: number;
 }
 
+/**
+ * One invoice per ACTIVE contract per period = contract billing amount + VAT.
+ * Deduped on (contract_id, period). Contract-driven: only employees with an
+ * active contract carrying a positive monthly billing amount are invoiced.
+ */
 export const generateMonthlyInvoices = api(
 	{ expose: true, auth: true, method: "POST", path: "/invoices/generate" },
 	async (req: GenerateInvoicesRequest): Promise<GenerateInvoicesResponse> => {
@@ -290,52 +309,53 @@ export const generateMonthlyInvoices = api(
 				"period_month and period_year are required",
 			);
 
-		const { employees } = await billing.listEmployees();
+		const { contracts } = await contract.listActiveForBilling();
 		const contact = await user
 			.getContact({ id: userID })
 			.catch(() => ({ name: null as string | null }));
 
-		// Existing (employee, period) pairs to avoid duplicates.
+		// Existing (contract, period) pairs to avoid duplicates on re-run.
 		const existing = new Set<string>();
-		const exRows = db.rawQuery<{ employee_id: string | null }>(
-			`SELECT employee_id FROM invoices
+		const exRows = db.rawQuery<{ contract_id: string | null }>(
+			`SELECT contract_id FROM invoices
        WHERE period_month = $1 AND period_year = $2 AND status <> 'cancelled'
-         AND employee_id IS NOT NULL`,
+         AND contract_id IS NOT NULL`,
 			req.period_month,
 			req.period_year,
 		);
 		for await (const r of exRows)
-			if (r.employee_id) existing.add(r.employee_id);
+			if (r.contract_id) existing.add(r.contract_id);
 
 		let created = 0;
 		let skipped = 0;
 		let totalAmount = 0;
 
-		for (const emp of employees) {
-			const billingAmount = Number(emp.monthly_billing) || 0;
-			if (billingAmount <= 0) {
-				skipped++;
-				continue;
-			}
-			if (existing.has(emp.id)) {
+		for (const c of contracts) {
+			const billingAmount = Number(c.monthly_billing_amount) || 0;
+			if (billingAmount <= 0 || existing.has(c.contract_id)) {
 				skipped++;
 				continue;
 			}
 			const id = crypto.randomUUID();
 			const reference = await nextReference();
-			const total = round2(billingAmount);
+			const amount = round2(billingAmount);
+			const vatRate = round2(Number(c.vat_percent) || 0);
+			const vatAmount = round2((amount * vatRate) / 100);
+			const total = round2(amount + vatAmount);
+			const desc = c.po_number
+				? `Monthly Services — ${c.employee_name} (PO ${c.po_number})`
+				: `Monthly Services — ${c.employee_name}`;
 			await db.exec`
         INSERT INTO invoices (
           id, reference, customer_id, customer_name, employee_id, employee_name,
-          period_month, period_year, description,
-          amount, total_amount, currency, status,
+          period_month, period_year, description, contract_id,
+          amount, vat_rate, vat_amount, total_amount, currency, status,
           created_by, created_by_name
         ) VALUES (
-          ${id}, ${reference}, ${emp.customer_id}, ${emp.customer_name},
-          ${emp.id}, ${emp.name},
-          ${req.period_month}, ${req.period_year},
-          ${`Monthly Outsourcing Services of ${emp.name}`},
-          ${total}, ${total}, 'SAR', 'draft',
+          ${id}, ${reference}, ${c.customer_id}, ${c.customer_name ?? ""},
+          ${c.employee_id}, ${c.employee_name},
+          ${req.period_month}, ${req.period_year}, ${desc}, ${c.contract_id},
+          ${amount}, ${vatRate}, ${vatAmount}, ${total}, 'SAR', 'draft',
           ${userID}, ${contact.name ?? null}
         )
       `;
@@ -494,6 +514,7 @@ interface UpdateInvoiceRequest {
 	period_year?: number | null;
 	description?: string | null;
 	amount?: number;
+	vat_rate?: number;
 	revenue_account?: string;
 	issue_date?: string | null;
 	due_date?: string | null;
@@ -515,7 +536,10 @@ export const updateInvoice = api(
 			);
 
 		const amount = req.amount != null ? round2(Number(req.amount)) : inv.amount;
-		const total = amount; // No tax/VAT — total always equals the net amount.
+		const vatRate =
+			req.vat_rate != null ? round2(Number(req.vat_rate)) : Number(inv.vat_rate);
+		const vatAmount = round2((amount * vatRate) / 100);
+		const total = round2(amount + vatAmount); // total = net + VAT
 		const revenueAccount =
 			req.revenue_account !== undefined
 				? resolveRevenueAccount(req.revenue_account)
@@ -531,6 +555,8 @@ export const updateInvoice = api(
         period_year   = ${req.period_year !== undefined ? req.period_year : inv.period_year},
         description   = ${req.description !== undefined ? req.description : inv.description},
         amount        = ${amount},
+        vat_rate      = ${vatRate},
+        vat_amount    = ${vatAmount},
         total_amount  = ${total},
         revenue_account = ${revenueAccount},
         issue_date    = ${req.issue_date !== undefined ? req.issue_date : inv.issue_date},
@@ -672,18 +698,24 @@ export const payInvoice = api(
 		);
 
 		// ── Cash-basis receipt: Dr 11100 Cash / Cr <revenue_account> ──────────
-		// Recognise revenue when the cash is received. `increment` is the amount
-		// actually collected on this call, so partial payments post correctly and
-		// never double-count. Best-effort: a posting failure must not fail the
-		// payment — reconcileInvoicesToLedger backfills any gap.
+		// Recognise revenue when the cash is received. The ledger stays NET — only
+		// the net (ex-VAT) portion of the collected `increment` is posted to
+		// revenue; VAT is an invoice-document figure and its accounting is
+		// deferred. Best-effort: a posting failure must not fail the payment —
+		// reconcileInvoicesToLedger backfills any gap.
+		const netRatio =
+			Number(inv.total_amount) > 0
+				? Number(inv.amount) / Number(inv.total_amount)
+				: 1;
+		const netIncrement = round2(increment * netRatio);
 		try {
 			await financial.recordAutoEntry({
 				fiscal_period: paidDate.slice(0, 7),
 				reference_source: `${inv.reference}:pay`,
 				description: `Invoice payment — ${inv.reference} — ${inv.customer_name}`,
 				debit_account: CASH_ACCOUNT, // 11100 cash in
-				credit_account: inv.revenue_account, // recognise revenue
-				amount: increment,
+				credit_account: inv.revenue_account, // recognise revenue (net)
+				amount: netIncrement,
 				actor_id: userID,
 				actor_name: contact.name ?? null,
 			});
@@ -859,9 +891,12 @@ export const reconcileInvoicesToLedger = api(
 			revenue_account: string;
 			paid_amount: string | null;
 			paid_date: string | null;
+			amount: string | null;
+			total_amount: string | null;
 		}>(
 			`SELECT reference, customer_name, revenue_account,
-			        paid_amount::TEXT AS paid_amount, paid_date::TEXT AS paid_date
+			        paid_amount::TEXT AS paid_amount, paid_date::TEXT AS paid_date,
+			        amount::TEXT AS amount, total_amount::TEXT AS total_amount
 			 FROM invoices
 			 WHERE paid_amount > 0
 			   AND ($1::date IS NULL OR paid_date >= $1::date)`,
@@ -874,13 +909,17 @@ export const reconcileInvoicesToLedger = api(
 		let amountPosted = 0;
 		for await (const inv of rows) {
 			checked++;
-			// Cash receipt (Dr Cash / Cr Revenue) for the amount actually paid.
+			// Cash receipt (Dr Cash / Cr Revenue) — NET portion only (ledger stays
+			// net; VAT deferred), matching the payInvoice posting basis.
 			const paid = round2(Number(inv.paid_amount ?? 0));
 			if (paid <= 0) continue;
+			const totalAmt = Number(inv.total_amount ?? 0);
+			const netRatio = totalAmt > 0 ? Number(inv.amount ?? 0) / totalAmt : 1;
+			const netPaid = round2(paid * netRatio);
 			const received = await financial.postedAmountForSource({
 				source_ref: `${inv.reference}:pay`,
 			});
-			const payDiff = round2(paid - Number(received.debit));
+			const payDiff = round2(netPaid - Number(received.debit));
 			if (payDiff > 0.005) {
 				try {
 					await financial.recordAutoEntry({

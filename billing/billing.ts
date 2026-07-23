@@ -236,6 +236,9 @@ interface EmployeeWithDetails {
 	band: string | null;
 	location: string | null;
 	payment_mode: string | null;
+	// Profile
+	nationality: string | null;
+	family_status: string | null;
 }
 
 interface ListEmployeesResponse {
@@ -251,6 +254,7 @@ export const listEmployees = api(
         e.id, e.serial_no, e.name, e.position,
         e.mobile_number, e.email,
         e.national_id, e.band, e.location, e.payment_mode,
+        e.nationality, e.family_status,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -300,6 +304,9 @@ interface CreateEmployeeRequest {
 	band?: string;
 	location?: string;
 	payment_mode?: string;
+	// Profile
+	nationality?: string;
+	family_status?: string;
 }
 
 export const createEmployee = api(
@@ -323,7 +330,8 @@ export const createEmployee = api(
 		const emp = await db.queryRow<{ id: string }>`
       INSERT INTO employees (
         name, position, customer_id, billing_months_override, serial_no,
-        mobile_number, email, national_id, band, location, payment_mode
+        mobile_number, email, national_id, band, location, payment_mode,
+        nationality, family_status
       )
       VALUES (
         ${req.name}, ${req.position}, ${req.customer_id},
@@ -331,7 +339,8 @@ export const createEmployee = api(
         ${req.serial_no ?? null},
         ${req.mobile_number ?? null}, ${req.email ?? null},
         ${req.national_id ?? null}, ${req.band ?? null},
-        ${req.location ?? null}, ${req.payment_mode ?? null}
+        ${req.location ?? null}, ${req.payment_mode ?? null},
+        ${req.nationality ?? null}, ${req.family_status ?? null}
       )
       RETURNING id
     `;
@@ -373,6 +382,7 @@ export const createEmployee = api(
         e.id, e.serial_no, e.name, e.position,
         e.mobile_number, e.email,
         e.national_id, e.band, e.location, e.payment_mode,
+        e.nationality, e.family_status,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -420,6 +430,9 @@ interface UpdateEmployeeRequest {
 	band?: string | null;
 	location?: string | null;
 	payment_mode?: string | null;
+	// Profile
+	nationality?: string | null;
+	family_status?: string | null;
 }
 
 export const updateEmployee = api(
@@ -458,7 +471,9 @@ export const updateEmployee = api(
         national_id            = CASE WHEN ${req.national_id !== undefined} THEN ${req.national_id ?? null} ELSE national_id END,
         band                   = CASE WHEN ${req.band !== undefined} THEN ${req.band ?? null} ELSE band END,
         location               = CASE WHEN ${req.location !== undefined} THEN ${req.location ?? null} ELSE location END,
-        payment_mode           = CASE WHEN ${req.payment_mode !== undefined} THEN ${req.payment_mode ?? null} ELSE payment_mode END
+        payment_mode           = CASE WHEN ${req.payment_mode !== undefined} THEN ${req.payment_mode ?? null} ELSE payment_mode END,
+        nationality            = CASE WHEN ${req.nationality !== undefined} THEN ${req.nationality ?? null} ELSE nationality END,
+        family_status          = CASE WHEN ${req.family_status !== undefined} THEN ${req.family_status ?? null} ELSE family_status END
       WHERE id = ${id}
     `;
 
@@ -511,6 +526,7 @@ export const updateEmployee = api(
         e.id, e.serial_no, e.name, e.position,
         e.mobile_number, e.email,
         e.national_id, e.band, e.location, e.payment_mode,
+        e.nationality, e.family_status,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,

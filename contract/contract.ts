@@ -56,6 +56,10 @@ export interface Contract {
 	renewed_by: string | null;
 	renewed_at: string | null;
 	renewed_contract_id: string | null;
+	// Client billing (drives monthly invoicing)
+	po_number: string | null;
+	monthly_billing_amount: number | null;
+	vat_percent: number;
 	// Enhanced fields
 	renewal_cycle: "monthly" | "quarterly" | "yearly";
 	contract_value: number | null;
@@ -105,6 +109,9 @@ const CONTRACT_COLS = `
 	activated_by, activated_at,
 	terminated_by, terminated_at, termination_reason,
 	renewed_by, renewed_at, renewed_contract_id,
+	po_number,
+	monthly_billing_amount::float8 AS monthly_billing_amount,
+	vat_percent::float8            AS vat_percent,
 	renewal_cycle, contract_value::float8 AS contract_value,
 	benefit_type,
 	gosi_amount::float8 AS gosi_amount,
@@ -202,6 +209,10 @@ interface CreateContractInput {
 	notice_period_days?: number;
 	file_url?: string;
 	notes?: string;
+	// Client billing (drives monthly invoicing)
+	po_number?: string;
+	monthly_billing_amount?: number;
+	vat_percent?: number;
 	// Enhanced fields
 	renewal_cycle?: "monthly" | "quarterly" | "yearly";
 	contract_value?: number;
@@ -239,6 +250,7 @@ export const createContract = api(
 				contract_type, start_date, end_date, probation_end_date,
 				salary_amount, salary_currency, notice_period_days,
 				file_url, notes, status, created_by, created_by_name,
+				po_number, monthly_billing_amount, vat_percent,
 				renewal_cycle, contract_value, benefit_type,
 				gosi_amount, family_benefit_amount, single_benefit_amount,
 				annual_ticket_amount, iqama_amount,
@@ -257,6 +269,9 @@ export const createContract = api(
 				${input.notice_period_days ?? 30},
 				${input.file_url ?? null}, ${input.notes ?? null},
 				'draft', ${userID}, ${creatorName},
+				${input.po_number ?? null},
+				${input.monthly_billing_amount ?? null},
+				${input.vat_percent ?? 15},
 				${input.renewal_cycle ?? "yearly"},
 				${input.contract_value ?? null},
 				${input.benefit_type ?? "single"},
@@ -348,6 +363,40 @@ export const listContracts = api(
 	},
 );
 
+// ─── Internal: active contracts for monthly invoicing ────────────────────────
+// Consumed by the invoice service to generate one invoice per active contract
+// per period. Only contracts with a positive monthly billing amount are billable.
+
+export interface ActiveContractBilling {
+	contract_id: string;
+	employee_id: string | null;
+	employee_name: string;
+	customer_id: string | null;
+	customer_name: string | null;
+	po_number: string | null;
+	monthly_billing_amount: number;
+	vat_percent: number;
+}
+
+export const listActiveForBilling = api(
+	{ expose: false, auth: false, method: "GET", path: "/internal/contracts/active-billing" },
+	async (): Promise<{ contracts: ActiveContractBilling[] }> => {
+		const rows = db.rawQuery<ActiveContractBilling>(
+			`SELECT id AS contract_id, employee_id, employee_name,
+			        customer_id, customer_name, po_number,
+			        monthly_billing_amount::float8 AS monthly_billing_amount,
+			        vat_percent::float8            AS vat_percent
+			 FROM contracts
+			 WHERE status = 'active'
+			   AND monthly_billing_amount IS NOT NULL
+			   AND monthly_billing_amount > 0`,
+		);
+		const contracts: ActiveContractBilling[] = [];
+		for await (const r of rows) contracts.push(r);
+		return { contracts };
+	},
+);
+
 // ─── Get ──────────────────────────────────────────────────────────────────────
 
 export const getContract = api(
@@ -388,6 +437,19 @@ export const updateContract = api(
 				notice_period_days  = COALESCE(${input.notice_period_days ?? null}, notice_period_days),
 				file_url            = CASE WHEN ${input.file_url !== undefined} THEN ${input.file_url ?? null} ELSE file_url END,
 				notes               = CASE WHEN ${input.notes !== undefined} THEN ${input.notes ?? null} ELSE notes END,
+				po_number              = CASE WHEN ${input.po_number !== undefined} THEN ${input.po_number ?? null} ELSE po_number END,
+				monthly_billing_amount = CASE WHEN ${input.monthly_billing_amount !== undefined} THEN ${input.monthly_billing_amount ?? null} ELSE monthly_billing_amount END,
+				vat_percent            = COALESCE(${input.vat_percent ?? null}, vat_percent),
+				renewal_cycle          = COALESCE(${input.renewal_cycle ?? null}, renewal_cycle),
+				contract_value         = CASE WHEN ${input.contract_value !== undefined} THEN ${input.contract_value ?? null} ELSE contract_value END,
+				benefit_type           = COALESCE(${input.benefit_type ?? null}, benefit_type),
+				gosi_amount            = COALESCE(${input.gosi_amount ?? null}, gosi_amount),
+				family_benefit_amount  = COALESCE(${input.family_benefit_amount ?? null}, family_benefit_amount),
+				single_benefit_amount  = COALESCE(${input.single_benefit_amount ?? null}, single_benefit_amount),
+				annual_ticket_amount   = COALESCE(${input.annual_ticket_amount ?? null}, annual_ticket_amount),
+				iqama_amount           = COALESCE(${input.iqama_amount ?? null}, iqama_amount),
+				sales_manager_id       = CASE WHEN ${input.sales_manager_id !== undefined} THEN ${input.sales_manager_id ?? null} ELSE sales_manager_id END,
+				sales_manager_name     = CASE WHEN ${input.sales_manager_name !== undefined} THEN ${input.sales_manager_name ?? null} ELSE sales_manager_name END,
 				updated_at          = NOW()
 			WHERE id = ${input.id}
 		`;
@@ -409,6 +471,22 @@ export const activateContract = api(
 			throw APIError.failedPrecondition(
 				`cannot activate a ${c.status} contract`,
 			);
+
+		// One active contract per employee — renewals must supersede via the
+		// renew flow, not by activating a parallel contract.
+		if (c.employee_id) {
+			const existing = await db.rawQueryRow<{ reference: string }>(
+				`SELECT reference FROM contracts
+				 WHERE employee_id = $1 AND status = 'active' AND id <> $2
+				 LIMIT 1`,
+				c.employee_id,
+				id,
+			);
+			if (existing)
+				throw APIError.failedPrecondition(
+					`this employee already has an active contract (${existing.reference}) — terminate or renew it first`,
+				);
+		}
 
 		await db.exec`
 			UPDATE contracts
@@ -489,6 +567,10 @@ interface RenewContractInput {
 	salary_amount?: number;
 	notes?: string;
 	file_url?: string;
+	// Optional billing overrides — default to the old contract's values.
+	po_number?: string;
+	monthly_billing_amount?: number;
+	vat_percent?: number;
 }
 
 export const renewContract = api(
@@ -521,7 +603,12 @@ export const renewContract = api(
 				employee_id, employee_name, customer_id, customer_name, job_title,
 				contract_type, start_date, end_date,
 				salary_amount, salary_currency, notice_period_days,
-				file_url, notes, status, created_by, created_by_name
+				file_url, notes, status, created_by, created_by_name,
+				po_number, monthly_billing_amount, vat_percent,
+				renewal_cycle, contract_value, benefit_type,
+				gosi_amount, family_benefit_amount, single_benefit_amount,
+				annual_ticket_amount, iqama_amount,
+				sales_manager_id, sales_manager_name
 			) VALUES (
 				${newId}, ${ref},
 				${old.employee_id ?? null}, ${old.employee_name},
@@ -532,7 +619,14 @@ export const renewContract = api(
 				${input.salary_amount ?? old.salary_amount ?? null},
 				${old.salary_currency}, ${old.notice_period_days},
 				${input.file_url ?? null}, ${input.notes ?? null},
-				'active', ${userID}, ${creatorName}
+				'active', ${userID}, ${creatorName},
+				${input.po_number ?? old.po_number ?? null},
+				${input.monthly_billing_amount ?? old.monthly_billing_amount ?? null},
+				${input.vat_percent ?? old.vat_percent ?? 15},
+				${old.renewal_cycle}, ${old.contract_value ?? null}, ${old.benefit_type},
+				${old.gosi_amount}, ${old.family_benefit_amount}, ${old.single_benefit_amount},
+				${old.annual_ticket_amount}, ${old.iqama_amount},
+				${old.sales_manager_id ?? null}, ${old.sales_manager_name ?? null}
 			)
 		`;
 		await logEvent(newId, "created_via_renewal", userID);
