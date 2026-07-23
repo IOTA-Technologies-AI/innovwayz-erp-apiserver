@@ -213,7 +213,8 @@ export const deleteCustomer = api(
 
 interface EmployeeWithDetails {
 	id: string;
-	serial_no: number;
+	// Nullable: created/imported employees may have no serial number yet.
+	serial_no: number | null;
 	name: string;
 	position: string;
 	customer_id: string;
