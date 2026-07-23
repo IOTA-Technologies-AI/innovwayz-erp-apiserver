@@ -36,6 +36,19 @@ export interface SalaryPayment {
 	additions: number;
 	deductions: number;
 	net_amount: number;
+	// Per-period payslip breakdown. `deductions` above stays authoritative for
+	// approvals/ledger and is kept in sync as the sum of the itemized figures
+	// (salary_advance + employee_requests_deduction + loss-of-pay + remote-work).
+	attendance_days: number | null;
+	government_holidays: number;
+	annual_leaves: number;
+	sick_leaves: number;
+	loss_of_pay_days: number;
+	days_payable: number;
+	pay_date: string | null;
+	remote_work_half: boolean;
+	salary_advance: number;
+	employee_requests_deduction: number;
 	currency: string;
 	notes: string | null;
 	payment_method: string | null;
@@ -90,6 +103,9 @@ function salaryAccountFor(customerId: string | null | undefined): string {
 const SALARY_COLUMNS = `
   id, reference, employee_id, employee_name, position, customer_id, customer_name,
   period_month, period_year, base_amount, additions, deductions, net_amount,
+  attendance_days, government_holidays, annual_leaves, sick_leaves,
+  loss_of_pay_days, days_payable, pay_date::TEXT AS pay_date, remote_work_half,
+  salary_advance, employee_requests_deduction,
   currency, notes, payment_method, salary_account, status,
   created_by, created_by_name,
   manager_approved_by, manager_approved_at, admin_approved_by, admin_approved_at,
@@ -241,6 +257,98 @@ function computeNet(base: number, additions: number, deductions: number) {
 	return Math.round((base + additions - deductions) * 100) / 100;
 }
 
+/** Per-period itemized deduction inputs printed on the payslip. */
+interface PayslipDeductionInput {
+	salary_advance?: number;
+	employee_requests_deduction?: number;
+	loss_of_pay_days?: number;
+	remote_work_half?: boolean;
+}
+
+/**
+ * Total deductions derived from the itemized payslip fields:
+ * salary advance + employee-requests recovery + loss-of-pay amount
+ * (days × daily rate, KSA daily rate = gross / 30) + remote-work-50%
+ * (half the gross when the arrangement is applied). Returns null when no
+ * itemized field is supplied, so callers can keep the caller-supplied total.
+ */
+function deriveDeductions(
+	base: number,
+	d: PayslipDeductionInput,
+): number | null {
+	const supplied =
+		d.salary_advance !== undefined ||
+		d.employee_requests_deduction !== undefined ||
+		d.loss_of_pay_days !== undefined ||
+		d.remote_work_half !== undefined;
+	if (!supplied) return null;
+	const advance = d.salary_advance ?? 0;
+	const empReq = d.employee_requests_deduction ?? 0;
+	const lopDays = d.loss_of_pay_days ?? 0;
+	const lopAmount = (base / 30) * lopDays;
+	const remote = d.remote_work_half ? base * 0.5 : 0;
+	return round2(advance + empReq + lopAmount + remote);
+}
+
+interface ResolvedDeductions {
+	deductions: number;
+	salaryAdvance: number;
+	empReqDeduction: number;
+	lossOfPayDays: number;
+	remoteWorkHalf: boolean;
+}
+
+/**
+ * Merge itemized deduction fields for an update (req overrides current). When
+ * the record carries any itemized deduction — or the caller touched one — the
+ * `deductions` total is recomputed from them; otherwise the caller-supplied
+ * lump (or the current total) is honored.
+ */
+function resolveUpdatedDeductions(
+	base: number,
+	req: {
+		deductions?: number;
+		salary_advance?: number;
+		employee_requests_deduction?: number;
+		loss_of_pay_days?: number;
+		remote_work_half?: boolean;
+	},
+	current: SalaryPayment,
+): ResolvedDeductions {
+	const salaryAdvance = req.salary_advance ?? Number(current.salary_advance);
+	const empReqDeduction =
+		req.employee_requests_deduction ??
+		Number(current.employee_requests_deduction);
+	const lossOfPayDays = req.loss_of_pay_days ?? Number(current.loss_of_pay_days);
+	const remoteWorkHalf = req.remote_work_half ?? current.remote_work_half;
+	const itemizedTouched =
+		req.salary_advance !== undefined ||
+		req.employee_requests_deduction !== undefined ||
+		req.loss_of_pay_days !== undefined ||
+		req.remote_work_half !== undefined;
+	const hasItemized =
+		itemizedTouched ||
+		salaryAdvance > 0 ||
+		empReqDeduction > 0 ||
+		lossOfPayDays > 0 ||
+		remoteWorkHalf;
+	const deductions = hasItemized
+		? (deriveDeductions(base, {
+				salary_advance: salaryAdvance,
+				employee_requests_deduction: empReqDeduction,
+				loss_of_pay_days: lossOfPayDays,
+				remote_work_half: remoteWorkHalf,
+			}) ?? Number(current.deductions))
+		: (req.deductions ?? Number(current.deductions));
+	return {
+		deductions,
+		salaryAdvance,
+		empReqDeduction,
+		lossOfPayDays,
+		remoteWorkHalf,
+	};
+}
+
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 const periodKey = (m: number, y: number) => `${y}-${String(m).padStart(2, "0")}`;
 const newBatchRef = () => `SALPAY-${crypto.randomUUID()}`;
@@ -346,6 +454,17 @@ interface CreateSalaryRequest {
 	currency?: string;
 	notes?: string;
 	payment_method?: string;
+	// Per-period payslip fields
+	attendance_days?: number;
+	government_holidays?: number;
+	annual_leaves?: number;
+	sick_leaves?: number;
+	loss_of_pay_days?: number;
+	days_payable?: number;
+	pay_date?: string;
+	remote_work_half?: boolean;
+	salary_advance?: number;
+	employee_requests_deduction?: number;
 }
 
 export const createSalaryPayment = api(
@@ -369,7 +488,10 @@ export const createSalaryPayment = api(
 			throw APIError.invalidArgument("base_amount must be a positive number");
 
 		const additions = req.additions ?? 0;
-		const deductions = req.deductions ?? 0;
+		// Itemized payslip deductions, when supplied, become the authoritative
+		// `deductions` total; otherwise fall back to the caller-supplied lump.
+		const itemized = deriveDeductions(req.base_amount, req);
+		const deductions = itemized ?? req.deductions ?? 0;
 		const net = computeNet(req.base_amount, additions, deductions);
 		const account = salaryAccountFor(req.customer_id);
 
@@ -382,11 +504,17 @@ export const createSalaryPayment = api(
         INSERT INTO salary_payments (
           id, reference, employee_id, employee_name, position, customer_id, customer_name,
           period_month, period_year, base_amount, additions, deductions, net_amount,
+          attendance_days, government_holidays, annual_leaves, sick_leaves,
+          loss_of_pay_days, days_payable, pay_date, remote_work_half,
+          salary_advance, employee_requests_deduction,
           currency, notes, payment_method, salary_account, status, created_by, created_by_name
         ) VALUES (
           ${id}, ${reference}, ${req.employee_id}, ${req.employee_name}, ${req.position ?? null},
           ${req.customer_id ?? null}, ${req.customer_name ?? null},
           ${req.period_month}, ${req.period_year}, ${req.base_amount}, ${additions}, ${deductions}, ${net},
+          ${req.attendance_days ?? null}, ${req.government_holidays ?? 0}, ${req.annual_leaves ?? 0}, ${req.sick_leaves ?? 0},
+          ${req.loss_of_pay_days ?? 0}, ${req.days_payable ?? 30}, ${req.pay_date ?? null}, ${req.remote_work_half ?? false},
+          ${req.salary_advance ?? 0}, ${req.employee_requests_deduction ?? 0},
           ${req.currency ?? "SAR"}, ${req.notes ?? null}, ${req.payment_method ?? null}, ${account},
           'pending_manager', ${userID}, ${creatorName}
         )
@@ -632,6 +760,17 @@ interface UpdateSalaryRequest {
 	salary_account?: string;
 	/** Required when the payable amount changes — captured in the audit trail. */
 	reason?: string;
+	// Per-period payslip fields
+	attendance_days?: number | null;
+	government_holidays?: number;
+	annual_leaves?: number;
+	sick_leaves?: number;
+	loss_of_pay_days?: number;
+	days_payable?: number;
+	pay_date?: string | null;
+	remote_work_half?: boolean;
+	salary_advance?: number;
+	employee_requests_deduction?: number;
 }
 
 export const updateSalaryPayment = api(
@@ -653,7 +792,13 @@ export const updateSalaryPayment = api(
 
 		const base = req.base_amount ?? Number(current.base_amount);
 		const additions = req.additions ?? Number(current.additions);
-		const deductions = req.deductions ?? Number(current.deductions);
+		const {
+			deductions,
+			salaryAdvance,
+			empReqDeduction,
+			lossOfPayDays,
+			remoteWorkHalf,
+		} = resolveUpdatedDeductions(base, req, current);
 		const net = computeNet(base, additions, deductions);
 		const prevNet = Number(current.net_amount);
 
@@ -686,6 +831,16 @@ export const updateSalaryPayment = api(
         additions      = ${additions},
         deductions     = ${deductions},
         net_amount     = ${net},
+        attendance_days     = ${req.attendance_days !== undefined ? req.attendance_days : current.attendance_days},
+        government_holidays = ${req.government_holidays ?? current.government_holidays},
+        annual_leaves       = ${req.annual_leaves ?? current.annual_leaves},
+        sick_leaves         = ${req.sick_leaves ?? current.sick_leaves},
+        loss_of_pay_days    = ${lossOfPayDays},
+        days_payable        = ${req.days_payable ?? current.days_payable},
+        pay_date            = ${req.pay_date !== undefined ? req.pay_date : current.pay_date},
+        remote_work_half    = ${remoteWorkHalf},
+        salary_advance      = ${salaryAdvance},
+        employee_requests_deduction = ${empReqDeduction},
         notes          = ${req.notes !== undefined ? req.notes : current.notes},
         payment_method = ${req.payment_method !== undefined ? req.payment_method : current.payment_method},
         salary_account = ${account},

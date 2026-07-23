@@ -231,6 +231,11 @@ interface EmployeeWithDetails {
 	// Contact (for the self-service timesheet portal)
 	mobile_number: string | null;
 	email: string | null;
+	// Payslip identity fields
+	national_id: string | null;
+	band: string | null;
+	location: string | null;
+	payment_mode: string | null;
 }
 
 interface ListEmployeesResponse {
@@ -245,6 +250,7 @@ export const listEmployees = api(
       SELECT
         e.id, e.serial_no, e.name, e.position,
         e.mobile_number, e.email,
+        e.national_id, e.band, e.location, e.payment_mode,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -289,6 +295,11 @@ interface CreateEmployeeRequest {
 	// Contact
 	mobile_number?: string;
 	email?: string;
+	// Payslip identity fields
+	national_id?: string;
+	band?: string;
+	location?: string;
+	payment_mode?: string;
 }
 
 export const createEmployee = api(
@@ -310,12 +321,17 @@ export const createEmployee = api(
 
 		// Insert employee
 		const emp = await db.queryRow<{ id: string }>`
-      INSERT INTO employees (name, position, customer_id, billing_months_override, serial_no, mobile_number, email)
+      INSERT INTO employees (
+        name, position, customer_id, billing_months_override, serial_no,
+        mobile_number, email, national_id, band, location, payment_mode
+      )
       VALUES (
         ${req.name}, ${req.position}, ${req.customer_id},
         ${req.billing_months_override ?? null},
         ${req.serial_no ?? null},
-        ${req.mobile_number ?? null}, ${req.email ?? null}
+        ${req.mobile_number ?? null}, ${req.email ?? null},
+        ${req.national_id ?? null}, ${req.band ?? null},
+        ${req.location ?? null}, ${req.payment_mode ?? null}
       )
       RETURNING id
     `;
@@ -356,6 +372,7 @@ export const createEmployee = api(
       SELECT
         e.id, e.serial_no, e.name, e.position,
         e.mobile_number, e.email,
+        e.national_id, e.band, e.location, e.payment_mode,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -398,6 +415,11 @@ interface UpdateEmployeeRequest {
 	// Contact
 	mobile_number?: string | null;
 	email?: string | null;
+	// Payslip identity fields
+	national_id?: string | null;
+	band?: string | null;
+	location?: string | null;
+	payment_mode?: string | null;
 }
 
 export const updateEmployee = api(
@@ -432,7 +454,11 @@ export const updateEmployee = api(
         customer_id            = ${customerId},
         billing_months_override = ${billingMonthsOverride},
         mobile_number          = CASE WHEN ${req.mobile_number !== undefined} THEN ${req.mobile_number ?? null} ELSE mobile_number END,
-        email                  = CASE WHEN ${req.email !== undefined} THEN ${req.email ?? null} ELSE email END
+        email                  = CASE WHEN ${req.email !== undefined} THEN ${req.email ?? null} ELSE email END,
+        national_id            = CASE WHEN ${req.national_id !== undefined} THEN ${req.national_id ?? null} ELSE national_id END,
+        band                   = CASE WHEN ${req.band !== undefined} THEN ${req.band ?? null} ELSE band END,
+        location               = CASE WHEN ${req.location !== undefined} THEN ${req.location ?? null} ELSE location END,
+        payment_mode           = CASE WHEN ${req.payment_mode !== undefined} THEN ${req.payment_mode ?? null} ELSE payment_mode END
       WHERE id = ${id}
     `;
 
@@ -484,6 +510,7 @@ export const updateEmployee = api(
       SELECT
         e.id, e.serial_no, e.name, e.position,
         e.mobile_number, e.email,
+        e.national_id, e.band, e.location, e.payment_mode,
         e.billing_months_override,
         c.id                                                         AS customer_id,
         c.name                                                       AS customer_name,
@@ -560,6 +587,11 @@ export interface EmployeeCompensation {
 	housing_allowance: number | null;
 	transport_allowance: number | null;
 	other_allowance: number | null;
+	// Payslip identity fields
+	national_id: string | null;
+	band: string | null;
+	location: string | null;
+	payment_mode: string | null;
 }
 
 /**
@@ -582,7 +614,8 @@ export const getEmployeeCompensation = api(
         s.basic_amount::float8        AS basic_amount,
         s.housing_allowance::float8   AS housing_allowance,
         s.transport_allowance::float8 AS transport_allowance,
-        s.other_allowance::float8     AS other_allowance
+        s.other_allowance::float8     AS other_allowance,
+        e.national_id, e.band, e.location, e.payment_mode
       FROM employees e
       JOIN customers c ON e.customer_id = c.id
       LEFT JOIN LATERAL (

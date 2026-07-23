@@ -308,20 +308,27 @@ async function generateLetterForRequest(
 			);
 		}
 
-		// Current-period overtime/additions and salary advance/deductions from
-		// the latest payroll record (list is sorted latest period first).
+		// Per-period payslip figures come from the latest non-rejected payroll
+		// record (list is sorted latest period first): overtime/additions, the
+		// itemized deductions, attendance/leaves and the pay period.
 		let overtime = 0;
 		let salaryAdvance = 0;
+		let latest: Awaited<
+			ReturnType<typeof payroll.listSalaryPayments>
+		>["salaries"][number] | undefined;
 		try {
 			const { salaries } = await payroll.listSalaryPayments({
 				employee_id: employeeId,
 			});
-			const latest = salaries.find(
+			latest = salaries.find(
 				(s) => !["rejected", "cancelled"].includes(s.status),
 			);
 			if (latest) {
 				overtime = Number(latest.additions) || 0;
-				salaryAdvance = Number(latest.deductions) || 0;
+				// Prefer the itemized advance; fall back to the legacy lump for
+				// records created before the payslip breakdown existed.
+				salaryAdvance =
+					Number(latest.salary_advance) || Number(latest.deductions) || 0;
 			}
 		} catch (err) {
 			log.warn("letter generation: payroll lookup failed", {
@@ -330,10 +337,10 @@ async function generateLetterForRequest(
 			});
 		}
 
-		// Loss of pay: leave days used beyond the allowed quota this year
-		// (entitled + carry-forward), across all leave types. Unpaid leave
-		// typically carries no entitlement, so it counts in full.
-		let lossOfPayDays = 0;
+		// Loss-of-pay days: taken from the payroll record when one exists;
+		// otherwise derived from leave balances (days used beyond entitlement +
+		// carry-forward across all leave types).
+		let leaveLopDays = 0;
 		try {
 			const { balances } = await leave.listLeaveBalances({
 				employee_id: employeeId,
@@ -344,7 +351,7 @@ async function generateLetterForRequest(
 					(Number(bal.entitled_days) || 0) +
 					(Number(bal.carry_forward_days) || 0);
 				const used = Number(bal.used_days) || 0;
-				if (used > allowed) lossOfPayDays += used - allowed;
+				if (used > allowed) leaveLopDays += used - allowed;
 			}
 		} catch (err) {
 			log.warn("letter generation: leave balance lookup failed", {
@@ -352,14 +359,14 @@ async function generateLetterForRequest(
 				error: String(err),
 			});
 		}
-		lossOfPayDays = Math.round(lossOfPayDays * 100) / 100;
-		// KSA convention: daily rate = monthly gross / 30
-		const lossOfPay =
-			Math.round(((emp.monthly_salary / 30) * lossOfPayDays) * 100) / 100;
+		const lossOfPayDays = latest
+			? Number(latest.loss_of_pay_days) || 0
+			: Math.round(leaveLopDays * 100) / 100;
 
+		const now = new Date();
 		const data: SalaryCertificateData = {
 			...base,
-			currency: "SAR",
+			currency: latest?.currency || "SAR",
 			monthlySalary: emp.monthly_salary,
 			breakdown: {
 				basic: emp.basic_amount,
@@ -369,8 +376,25 @@ async function generateLetterForRequest(
 			},
 			overtime,
 			lossOfPayDays,
-			lossOfPay,
 			salaryAdvance,
+			// Employee-level payslip identity
+			mode: emp.payment_mode,
+			nationalId: emp.national_id,
+			band: emp.band,
+			location: emp.location,
+			// Per-period payslip figures
+			periodMonth: latest?.period_month ?? now.getMonth() + 1,
+			periodYear: latest?.period_year ?? now.getFullYear(),
+			payDate: latest?.pay_date ?? null,
+			attendanceDays: latest?.attendance_days ?? null,
+			governmentHolidays: latest ? Number(latest.government_holidays) || 0 : 0,
+			annualLeaves: latest ? Number(latest.annual_leaves) || 0 : 0,
+			sickLeaves: latest ? Number(latest.sick_leaves) || 0 : 0,
+			daysPayable: latest ? Number(latest.days_payable) || 30 : 30,
+			remoteWorkHalf: latest?.remote_work_half ?? false,
+			employeeRequestsDeduction: latest
+				? Number(latest.employee_requests_deduction) || 0
+				: 0,
 		};
 		pdf = await generateSalaryCertificate(data);
 		label = "Salary_Certificate";
