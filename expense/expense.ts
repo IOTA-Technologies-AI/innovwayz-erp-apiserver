@@ -1,7 +1,7 @@
 import { api, APIError } from "encore.dev/api";
 import { getAuthData } from "~encore/auth";
 import { SQLDatabase } from "encore.dev/storage/sqldb";
-import { user, financial } from "~encore/clients";
+import { user, financial, billing } from "~encore/clients";
 import log from "encore.dev/log";
 import crypto from "node:crypto";
 import { canAccessModule, MODULE_ROUTES } from "../authz/capabilities";
@@ -420,7 +420,7 @@ interface ListExpensesResponse {
 export const listExpenses = api(
 	{ expose: true, auth: true, method: "GET", path: "/expenses" },
 	async (p: ListExpensesParams): Promise<ListExpensesResponse> => {
-		const { userID } = getAuthData()!;
+		const { userID, role } = getAuthData()!;
 
 		const clauses: string[] = [];
 		const args: (string | number | boolean | null)[] = [];
@@ -429,9 +429,21 @@ export const listExpenses = api(
 			clauses.push(clause.replace("$?", `$${args.length}`));
 		};
 
-		// Plain users only see their own expenses; managers/finance can opt into 'mine'.
-		const restrictToOwn = !canManageExpenses() || !!p.mine;
-		if (restrictToOwn) {
+		// BDMs see ONLY expenses of employees tagged to them (employee_id IN …,
+		// which also excludes company expenses with a NULL employee_id).
+		if (role === "bdm") {
+			const { employee_ids } = await billing.getBdmEmployeeIds({
+				bdm_user_id: userID,
+			});
+			if (employee_ids.length === 0)
+				return { expenses: [], total: 0, limit: Number(p.limit) || 100, offset: Number(p.offset) || 0 };
+			const ph = employee_ids.map((id) => {
+				args.push(id);
+				return `$${args.length}`;
+			});
+			clauses.push(`employee_id IN (${ph.join(", ")})`);
+		} else if (!canManageExpenses() || !!p.mine) {
+			// Plain users only see their own expenses; managers/finance can opt into 'mine'.
 			add("created_by = $?", userID);
 		}
 		if (p.status) add("status = $?", p.status);

@@ -75,7 +75,8 @@ const DEFAULT_ROUTES: Record<string, string[]> = {
 		"/admin/main/profile/overview",
 		"/admin/main/profile/settings",
 	],
-	// BDMs see only Sales pages and their own profile
+	// BDMs see Sales pages, their own profile, and read-only, scoped-to-their-
+	// tagged-employees views of salaries / expenses / invoices / requests.
 	bdm: [
 		"/admin/dashboards/default",
 		"/admin/main/sales/pipeline",
@@ -83,6 +84,10 @@ const DEFAULT_ROUTES: Record<string, string[]> = {
 		"/admin/main/sales/contacts",
 		"/admin/main/sales/activities",
 		"/admin/main/sales/reports",
+		"/admin/main/salaries",
+		"/admin/main/expenses",
+		"/admin/main/invoices",
+		"/admin/main/employee-requests",
 		"/admin/main/profile/overview",
 		"/admin/main/profile/settings",
 	],

@@ -61,6 +61,10 @@ export function canAccessModule(
 	privilegedRoles: string[] = [],
 ): boolean {
 	if (auth.role === "super_admin") return true;
+	// BDMs are scoped read-only viewers of their tagged employees' records —
+	// a granted module route lets them SEE the menu/page, never manage. List
+	// endpoints scope their visibility explicitly; writes stay denied here.
+	if (auth.role === "bdm") return false;
 	if (privilegedRoles.includes(auth.role)) return true;
 	return hasRouteGrant(auth.allowedRoutes, moduleRoute);
 }

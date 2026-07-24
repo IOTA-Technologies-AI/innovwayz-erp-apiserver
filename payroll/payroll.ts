@@ -762,7 +762,7 @@ interface ListSalaryParams {
 export const listSalaryPayments = api(
 	{ expose: true, auth: true, method: "GET", path: "/payroll" },
 	async (p: ListSalaryParams): Promise<{ salaries: SalaryPayment[] }> => {
-		const { userID } = getAuthData()!;
+		const { userID, role } = getAuthData()!;
 
 		const clauses: string[] = [];
 		const args: (string | number | boolean | null)[] = [];
@@ -771,9 +771,20 @@ export const listSalaryPayments = api(
 			clauses.push(clause.replace("$?", `$${args.length}`));
 		};
 
-		// Managers/finance and users granted the Salaries module see everyone;
-		// others see nothing unless it's theirs.
-		if (!canManageSalaries() || p.mine) {
+		// BDMs see ONLY the salaries of employees tagged to them.
+		if (role === "bdm") {
+			const { employee_ids } = await billing.getBdmEmployeeIds({
+				bdm_user_id: userID,
+			});
+			if (employee_ids.length === 0) return { salaries: [] };
+			const ph = employee_ids.map((id) => {
+				args.push(id);
+				return `$${args.length}`;
+			});
+			clauses.push(`employee_id IN (${ph.join(", ")})`);
+		} else if (!canManageSalaries() || p.mine) {
+			// Managers/finance and users granted the Salaries module see everyone;
+			// others see nothing unless it's theirs.
 			add("created_by = $?", userID);
 		}
 		if (p.status) add("status = $?", p.status);
@@ -971,6 +982,65 @@ export const postSalaryPayment = api(
 			),
 		);
 		return updated;
+	},
+);
+
+// ─── Bulk post (multi-select submit drafts for approval) ──────────────────────
+
+interface PostBatchRequest {
+	ids: string[];
+}
+interface PostBatchResponse {
+	posted: number;
+	skipped: number;
+}
+
+export const postBatch = api(
+	{ expose: true, auth: true, method: "POST", path: "/payroll/post-batch" },
+	async (req: PostBatchRequest): Promise<PostBatchResponse> => {
+		const { userID } = getAuthData()!;
+		if (!Array.isArray(req.ids) || req.ids.length === 0)
+			throw APIError.invalidArgument("select at least one salary to submit");
+		const actorName = await actorNameOf(userID);
+		const canManage = canManageSalaries();
+
+		let posted = 0;
+		let skipped = 0;
+		const postedRefs: string[] = [];
+		for (const id of req.ids) {
+			const s = await db.rawQueryRow<SalaryPayment>(
+				`SELECT ${SALARY_COLUMNS} FROM salary_payments WHERE id = $1`,
+				id,
+			);
+			// Only the creator or a salaries-manager may submit, and only drafts.
+			if (!s || s.status !== "draft" || (s.created_by !== userID && !canManage)) {
+				skipped++;
+				continue;
+			}
+			await db.exec`
+        UPDATE salary_payments SET
+          status = 'pending_manager', posted_by = ${userID}, posted_at = NOW(), updated_at = NOW()
+        WHERE id = ${id}
+      `;
+			await logEvent(id, "submitted", userID, actorName);
+			postedRefs.push(s.reference);
+			posted++;
+		}
+
+		// One summary notification for the whole batch (not one per row).
+		if (posted > 0) {
+			void notifyRoles(
+				["manager", "admin", "super_admin"],
+				`${posted} salaries submitted for approval`,
+				emailShell(
+					"Salaries Submitted for Approval",
+					`<tr><td style="padding:6px 0;color:#94a3b8;width:170px;">Submitted</td><td style="padding:6px 0;color:#0f172a;font-weight:700;">${posted}</td></tr>` +
+						`<tr><td style="padding:6px 0;color:#94a3b8;">References</td><td style="padding:6px 0;color:#0f172a;font-weight:600;">${postedRefs.slice(0, 25).join(", ")}${postedRefs.length > 25 ? " …" : ""}</td></tr>`,
+					"Please review these salary payments in the InnovWayz ERP portal.",
+				),
+			);
+		}
+		return { posted, skipped };
 	},
 );
 

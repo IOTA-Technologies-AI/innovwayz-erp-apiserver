@@ -625,8 +625,21 @@ export const listRequests = api(
 			clauses.push(clause.replace("$?", `$${args.length}`));
 		};
 
-		// Non-managers see only their own requests
-		if (!isManager(role) || input.mine) add("created_by = $?", userID);
+		// BDMs see ONLY requests for employees tagged to them.
+		if (role === "bdm") {
+			const { employee_ids } = await billing.getBdmEmployeeIds({
+				bdm_user_id: userID,
+			});
+			if (employee_ids.length === 0) return { requests: [], total: 0 };
+			const ph = employee_ids.map((id) => {
+				args.push(id);
+				return `$${args.length}`;
+			});
+			clauses.push(`employee_id IN (${ph.join(", ")})`);
+		} else if (!isManager(role) || input.mine) {
+			// Non-managers see only their own requests
+			add("created_by = $?", userID);
+		}
 		if (input.status) add("status = $?", input.status);
 		if (input.request_type) add("request_type = $?", input.request_type);
 		if (input.employee_id) add("employee_id = $?", input.employee_id);

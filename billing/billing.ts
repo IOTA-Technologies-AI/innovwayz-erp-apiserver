@@ -760,6 +760,27 @@ export const removeEmployeeFromBdm = api(
 	},
 );
 
+// ─── Internal: employee ids tagged to a BDM (for record scoping) ──────────────
+// Used by payroll/invoice/expense/request to restrict a BDM's visibility to
+// only the employees assigned to them.
+
+export const getBdmEmployeeIds = api(
+	{ expose: false, auth: false, method: "POST", path: "/internal/bdm/employee-ids" },
+	async ({
+		bdm_user_id,
+	}: {
+		bdm_user_id: string;
+	}): Promise<{ employee_ids: string[] }> => {
+		const rows = db.rawQuery<{ employee_id: string }>(
+			`SELECT employee_id::text AS employee_id FROM bdm_assignments WHERE bdm_user_id = $1`,
+			bdm_user_id,
+		);
+		const employee_ids: string[] = [];
+		for await (const r of rows) employee_ids.push(r.employee_id);
+		return { employee_ids };
+	},
+);
+
 // ─── Employee allied documents ────────────────────────────────────────────────
 // Iqama, Insurance, GOSI, Saudi Council of Engineers cert, air ticket, passport,
 // … each with an expiry_date that drives renewal reminders (Phase 3 cron).
